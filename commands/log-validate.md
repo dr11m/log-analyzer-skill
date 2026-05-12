@@ -1,7 +1,6 @@
 ---
 description: Code-aware log validation — builds Log Signature Map from source code, greps log for every expected pattern, detects errors, anomalies, and silent components
 agent: plan
-subtask: true
 ---
 
 Load the log-validate skill and validate the log file against the project source code.

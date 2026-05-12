@@ -1,7 +1,6 @@
 ---
 description: Inductive log analysis — splits log into N chunks, analyzes each in parallel against project documentation, consolidates trend-aware findings
 agent: plan
-subtask: true
 ---
 
 Load the log-insight skill and analyze the log file using chunked inductive analysis.
