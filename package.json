@@ -1,6 +1,6 @@
 {
   "name": "@dr39m/log-analyzer-suite",
-  "version": "1.0.11",
+  "version": "1.0.12",
   "description": "OpenCode plugin for AI-powered log analysis — inductive chunk analysis (log-insight) and deductive source-code-aware validation (log-validate)",
   "type": "module",
   "main": "dist/index.js",
