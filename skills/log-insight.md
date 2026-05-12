@@ -53,15 +53,17 @@ The briefing must be passed directly in every sub-agent prompt. Sub-agents must 
 
 ## Phase 2: Split the Log into Chunks (Tool Returns Ready Prompts)
 
-Use the `split_log_chunks` tool. It loads the file, slices it into N equal chunks from the END of the file, and **returns a fully-rendered sub-agent prompt for each chunk** with the raw log content already embedded.
+Call the **native opencode tool** `split_log_chunks`. This is a built-in tool registered by the `@dr39m/log-analyzer-suite` plugin — invoke it directly the same way you would invoke `Read`, `Grep`, or `Bash`. It is NOT a shell command, NOT a Python script, and NOT a file on disk.
 
-```
-Tool: split_log_chunks
-Args:
-  logPath: "<absolute path to log file>"
-  chunks: <N from user input>
-  contextTokens: <K from --context, in thousands of tokens; default 200>
-```
+If the `split_log_chunks` tool is not available in your tool list, the plugin failed to load. STOP and report the issue to the user. Do NOT improvise — do NOT split the file with `Bash`/`Read`/`Python`, do NOT write your own splitter. The whole point of this skill is that the splitting is done by this single tool.
+
+Parameters:
+
+- `logPath` (string, required) — absolute path to the log file.
+- `chunks` (number, required) — N from the user's `--chunks` flag.
+- `contextTokens` (number, optional, default 200) — K from the user's `--context` flag, in thousands of tokens.
+
+The tool loads the file, slices it into N equal chunks from the END of the file, and **returns a fully-rendered sub-agent prompt for each chunk** with the raw log content already embedded.
 
 The tool returns JSON with:
 - `total_lines`, `total_bytes` — file size
