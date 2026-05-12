@@ -1,11 +1,12 @@
 /**
  * Log Analyzer Suite — OpenCode Plugin
  *
- * Provides one custom tool (split_log_chunks) that calculates offset/limit
- * pairs for chunked inductive log analysis. Everything else is driven by
- * skills using built-in tools (Read, Grep, Bash, Agent).
+ * Provides one custom tool (split_log_chunks) that splits a log file into N
+ * equal chunks and returns the raw text of each chunk inline. The orchestrator
+ * then passes each chunk's content directly into a sub-agent prompt — no Read
+ * tool calls by sub-agents, no offset/limit math, no 50KB Read cap.
  *
- * Installation: add "@dr1m/log-analyzer-suite" to opencode.json plugins.
+ * Installation: add "@dr39m/log-analyzer-suite" to opencode.json plugins.
  * Skills and commands are auto-bootstrapped on first run.
  */
 import type { Plugin } from "@opencode-ai/plugin";
@@ -111,32 +112,45 @@ export const LogAnalyzerSuite: Plugin = async ({ directory, client }) => {
   // -----------------------------------------------------------------------
   // Tool: split_log_chunks
   //
-  // Reads the log file, calculates chunk offsets, returns metadata.
-  // Does NOT write files — sub-agents use Read(offset, limit) on the
-  // original log file.
+  // Reads the log file, splits it into N equal chunks bounded by 70% of the
+  // model context window, and returns each chunk's raw text inline. The
+  // orchestrator embeds chunk content directly into sub-agent prompts —
+  // sub-agents never call Read.
   // -----------------------------------------------------------------------
+
+  const MAX_FILE_BYTES = 200 * 1024 * 1024; // 200 MB safety cap (file is loaded fully into memory)
+  const BYTES_PER_TOKEN = 3.5; // conservative estimate for mixed-content logs
+  const CHUNK_BUDGET_RATIO = 0.7; // each chunk fills up to 70% of context window
 
   const splitLogChunksTool = tool({
     description:
-      "Calculate chunk boundaries for chunked log analysis. " +
-      "Reads a log file, counts lines and bytes, then computes N equal-sized " +
-      "offset/limit pairs from the END of the file (newest data). " +
-      "Returns JSON with total lines, bytes, lines per chunk, coverage %, " +
-      "and an array of {number, offset, limit} for each chunk. " +
-      "Chunk 1 = oldest analyzed, Chunk N = newest. " +
-      "Does NOT write chunk files to disk — sub-agents should use the Read " +
-      "tool with the returned offset/limit values on the original log file.",
+      "Split a log file into N equal chunks and return each chunk's raw text inline. " +
+      "Chunks are sliced from the END of the file (newest data first) so the most recent " +
+      "lines are always covered. Each chunk is capped at ~70% of the model context window " +
+      "to leave room for PROJECT_BRIEFING and the sub-agent's response. " +
+      "Chunk 1 = oldest analyzed slice, Chunk N = newest (file tail). " +
+      "The orchestrator embeds chunks[i].content directly into the sub-agent prompt — " +
+      "sub-agents do NOT use Read/Grep on the log file.",
     args: {
       logPath: tool.schema
         .string()
         .describe("Absolute path to the log file"),
       chunks: tool.schema
         .number()
-        .describe("Number of chunks to analyze (e.g. 5)"),
+        .describe("Number of chunks to produce (e.g. 5)"),
+      contextTokens: tool.schema
+        .number()
+        .optional()
+        .describe(
+          "Model context window in THOUSANDS OF TOKENS (e.g. 200 = 200K tokens, 700 = 700K tokens). " +
+          "Default: 200. Each chunk is capped at contextTokens * 1000 * 0.70 tokens, " +
+          "estimated as bytes / 3.5.",
+        ),
     },
     async execute(args, _ctx) {
       const logPath = args.logPath as string;
       const requestedChunks = args.chunks as number;
+      const contextTokens = (args.contextTokens as number | undefined) ?? 200;
 
       const file = Bun.file(logPath);
       if (!(await file.exists())) {
@@ -144,36 +158,74 @@ export const LogAnalyzerSuite: Plugin = async ({ directory, client }) => {
       }
 
       const totalBytes = file.size;
+      if (totalBytes > MAX_FILE_BYTES) {
+        return JSON.stringify({
+          error:
+            `Log file too large: ${totalBytes} bytes exceeds the ${MAX_FILE_BYTES}-byte safety cap. ` +
+            `Pre-trim the file (e.g. tail -n 100000) before running /log-insight.`,
+        });
+      }
+
       const text = await file.text();
       // Count lines preserving the last empty string from trailing \n
       const lines = text.split("\n");
       const totalLines = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;
 
       const avgBytesPerLine = totalLines > 0 ? totalBytes / totalLines : 100;
-      const targetChunkBytes = 500_000;
 
-      let linesPerChunk = Math.floor(targetChunkBytes / avgBytesPerLine);
-      linesPerChunk = Math.min(linesPerChunk, 10_000);
-      linesPerChunk = Math.min(linesPerChunk, Math.floor(totalLines / requestedChunks));
-      if (linesPerChunk < 1) linesPerChunk = 1;
+      // 70% of context, converted to bytes via BYTES_PER_TOKEN
+      const maxChunkTokens = contextTokens * 1000 * CHUNK_BUDGET_RATIO;
+      const maxChunkBytes = Math.floor(maxChunkTokens * BYTES_PER_TOKEN);
+      const linesByContext = Math.max(1, Math.floor(maxChunkBytes / avgBytesPerLine));
+      const linesByDivision = Math.max(1, Math.floor(totalLines / requestedChunks));
+      const linesPerChunk = Math.min(linesByContext, linesByDivision);
 
-      // Overflow check
-      if (totalLines < requestedChunks * 100 && requestedChunks > 1) {
-        const reduced = Math.max(1, Math.floor(totalLines / 100));
+      // File too small to give each chunk a reasonable number of lines.
+      if (totalLines < requestedChunks * 10 && requestedChunks > 1) {
+        const reduced = Math.max(1, Math.floor(totalLines / 10));
         return JSON.stringify({
-          error: `File too small: ${totalLines} lines for ${requestedChunks} chunks. ` +
-            `Suggest N=${reduced} or smaller.`,
+          error:
+            `File too small: ${totalLines} lines for ${requestedChunks} chunks. ` +
+            `Suggest --chunks ${reduced} or smaller.`,
         });
+      }
+
+      const warnings: string[] = [];
+
+      // Coverage warning: chunk size was capped by the context budget, not by division.
+      if (linesByContext < linesByDivision) {
+        const analyzedLines = requestedChunks * linesPerChunk;
+        const uncoveredPercent = ((totalLines - analyzedLines) / totalLines) * 100;
+        warnings.push(
+          `chunk_size capped at 70% of context (${linesPerChunk} lines/chunk). ` +
+          `~${uncoveredPercent.toFixed(1)}% of the file is uncovered — ` +
+          `raise --chunks or --context for fuller coverage.`,
+        );
+      }
+
+      // Sanity warning: chunks have too few lines to be useful.
+      if (linesPerChunk < 100) {
+        warnings.push(
+          `chunk size very small: ${linesPerChunk} lines/chunk. ` +
+          `Consider lowering --chunks for more meaningful analysis windows.`,
+        );
       }
 
       const manifestChunks: Record<string, unknown>[] = [];
       for (let i = 1; i <= requestedChunks; i++) {
-        const offset = totalLines - (requestedChunks - i + 1) * linesPerChunk + 1;
+        const rawOffset = totalLines - (requestedChunks - i + 1) * linesPerChunk + 1;
+        const offset = Math.max(1, rawOffset);
+        const chunkLines = lines.slice(offset - 1, offset - 1 + linesPerChunk);
+        const content = chunkLines.join("\n");
+        const byteSize = Buffer.byteLength(content, "utf8");
         manifestChunks.push({
           number: i,
           total: requestedChunks,
-          offset: Math.max(1, offset),
+          offset,
           limit: linesPerChunk,
+          byte_size: byteSize,
+          est_tokens: Math.round(byteSize / BYTES_PER_TOKEN),
+          content,
         });
       }
 
@@ -190,6 +242,9 @@ export const LogAnalyzerSuite: Plugin = async ({ directory, client }) => {
           lines_per_chunk: linesPerChunk,
           analyzed_lines: analyzedLines,
           coverage_percent: Number(coveragePercent.toFixed(1)),
+          context_tokens_k: contextTokens,
+          max_chunk_tokens: Math.round(maxChunkTokens),
+          warnings,
           chunks: manifestChunks,
         },
         null,
