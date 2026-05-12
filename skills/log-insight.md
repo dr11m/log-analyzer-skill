@@ -1,40 +1,37 @@
 ---
 name: log-insight
-description: Chunked inductive log analysis. Use when the user asks to analyze application logs by splitting a log file into fixed-size chunks, analyzing each with a sub-agent against project documentation, and merging findings into a trend report. Accepts requests like "analyze logs/app.log with 5 chunks" or "/log-insight --chunks 5 --log logs/app.log".
+description: Chunked inductive log analysis. Use when the user asks to analyze application logs by splitting a log file into fixed-size chunks, analyzing each with a sub-agent against project documentation, and merging findings into a trend report. Accepts requests like "analyze logs/app.log with 5 chunks" or "/log-insight 5 logs/app.log".
 ---
 
 # Log Insight
 
 ## Contract
 
-Act as the orchestrator. Do not analyze log contents yourself — your job is to read raw chunks and pass them to sub-agents verbatim.
+Act as the orchestrator. Do not analyze log contents yourself — your job is to compute chunk boundaries and prepare chunk files, then pass them to sub-agents.
 
 Use the user's language for reports and user-facing explanations. Keep log lines, code identifiers, exception names, file paths, and technical terms as written.
 
-This skill is intentionally inductive: each sub-agent receives one complete log chunk plus project context embedded directly in its prompt. Sub-agents must not use tools — they receive everything inline and respond immediately.
+This skill is intentionally inductive: each sub-agent receives instructions first, then the full chunk text at the end of the prompt. Sub-agents must not use tools.
 
-### Context Budget (Tokens, Not Bytes)
+No external scripts, no temp files, no plugins. Only built-in tools: Bash, Read, Task.
 
-Pass the sub-agent context window via the `contextTokens` argument of `split_log_chunks` (in thousands of tokens — `200` = 200K, `700` = 700K). The tool sizes each chunk at up to **70% of that window**, leaving room for the PROJECT_BRIEFING and the sub-agent's response.
+## Context Budget (Tokens, Not Bytes)
 
-This limit is in **model tokenizer units**. It is NOT about:
-- Characters, bytes, or kilobytes of the log file
-- Number of log lines alone
-- File size as reported by the filesystem
+The model context window is approximately **200,000 tokens**. The PROJECT_BRIEFING plus one log chunk must together fit within roughly **70% of that window (~140,000 tokens)**.
 
-The tool reports `lines_per_chunk`, `max_chunk_tokens`, and emits `warnings[]` when the file is too large for N chunks at the chosen context. If the warnings indicate partial coverage, surface them to the user and suggest raising `--chunks` or `--context`.
+This limit refers to **model tokenizer units** (roughly 0.75 words per token for English, fewer for dense log lines). It is NOT about characters, bytes, kilobytes, or line count. Use ~4 chars/token as a rough estimation heuristic.
 
 ## Required Input
 
-Parse the user's request as flags (order does not matter):
+Parse the user's request for:
 
-- `--chunks N` (integer, required) — number of chunks to analyze
-- `--log <path>` (string, optional) — explicit path to the log file. If not provided, auto-discover.
-- `--context <K>` (integer, optional, default 200) — sub-agent context window in thousands of tokens.
+- **N** (integer, required) — number of chunks to analyze
+- **log path** (string, optional) — explicit path to the log file. If not provided, auto-discover.
+- **context** (integer, optional) — model context window in **thousands of tokens** (e.g. `200` for 200K tokens, `250` for 250K tokens). Default: `200`.
 
-Examples: `/log-insight --chunks 5 --log logs/app.log`, `/log-insight --chunks 3`, `/log-insight --chunks 5 --context 700`.
+Examples: `5 logs/app.log`, `5 logs/app.log 250`, `/log-insight 5`
 
-If `--chunks` is missing, ask the user. If `--log` is missing, auto-discover in the next phase.
+If N is missing, ask the user. If log path is missing, auto-discover.
 
 ## Phase 1: Build Project Briefing First
 
@@ -47,59 +44,154 @@ Build one `PROJECT_BRIEFING` for all sub-agents:
 - Read `README.md` if it contains runtime or business context.
 - Include business rules and workflow rules with high fidelity. If `docs/rules.md`, `docs/business_rules.md`, or equivalent files exist, include their important rule text directly.
 - Summarize architecture, runtime flow, components, expected success path, domain rules, configuration requirements, state transitions, and known invariants.
-- Keep the briefing compact — it must fit alongside one chunk within the ~140K token budget.
+- Keep the briefing compact — it must fit alongside one chunk within the ~70% token budget.
 
 The briefing must be passed directly in every sub-agent prompt. Sub-agents must not read project docs or source files themselves.
 
-## Phase 2: Split the Log into Chunks (Tool Returns Ready Prompts)
+## Phase 2: Calculate Chunk Boundaries and Read All Chunks
 
-Call the **native opencode tool** `split_log_chunks`. This is a built-in tool registered by the `@dr39m/log-analyzer-suite` plugin — invoke it directly the same way you would invoke `Read`, `Grep`, or `Bash`. It is NOT a shell command, NOT a Python script, and NOT a file on disk.
+### Step 2a: Get file stats
 
-If the `split_log_chunks` tool is not available in your tool list, the plugin failed to load. STOP and report the issue to the user. Do NOT improvise — do NOT split the file with `Bash`/`Read`/`Python`, do NOT write your own splitter. The whole point of this skill is that the splitting is done by this single tool.
+Run TWO Bash commands in parallel to get file dimensions:
 
-Parameters:
+```bash
+(Get-Content -LiteralPath "<LOG_PATH>" | Measure-Object -Line).Lines
+```
+```bash
+(Get-Item -LiteralPath "<LOG_PATH>").Length
+```
 
-- `logPath` (string, required) — absolute path to the log file.
-- `chunks` (number, required) — N from the user's `--chunks` flag.
-- `contextTokens` (number, optional, default 200) — K from the user's `--context` flag, in thousands of tokens.
-- `projectBriefing` (string, required for the workflow to work without manual substitution) — pass the full PROJECT_BRIEFING text you built in Phase 1. The tool inlines it into each `chunks[i].agent_prompt`, so the orchestrator does NOT have to do any string replacement.
+First returns `total_lines` (integer). Second returns `total_bytes` (integer).
 
-The tool loads the file, slices it into N equal chunks from the END of the file, and **returns a fully-rendered sub-agent prompt for each chunk** with both the raw log content AND the project briefing already embedded.
+### Step 2b: Compute chunk layout
 
-The tool returns JSON with:
-- `total_lines`, `total_bytes` — file size
-- `lines_per_chunk` — how many lines each chunk covers
-- `analyzed_lines`, `coverage_percent` — total lines covered and % of the file
-- `context_tokens_k`, `max_chunk_tokens` — context budget echo
-- `warnings[]` — coverage/sizing warnings to relay to the user
-- `chunks[]` — array of `{number, total, byte_size, line_count, est_tokens, agent_prompt}` for each chunk
+Calculate chunk boundaries manually. The math:
 
-Chunks are numbered oldest to newest. Chunk 1 = oldest analyzed portion, Chunk N = newest (file tail).
+```
+context_K_tokens = <user-provided context or 200>
+target_chunk_tokens = context_K_tokens * 1000 * 0.70
+target_chunk_bytes  = target_chunk_tokens * 4        # ~4 chars per token
 
-**Do NOT read the log file yourself. Do NOT build the sub-agent prompt yourself. Do NOT modify `chunks[i].agent_prompt` in any way.** Each `chunks[i].agent_prompt` is already a complete Task prompt — it contains the analysis instructions, chunk metadata, the project briefing (because you passed `projectBriefing` to the tool), the full raw log content, and the output template. There are NO placeholders left to fill — just pass the string to the Task tool verbatim.
+avg_bytes_per_line  = total_bytes / total_lines
+raw_lines_per_chunk = target_chunk_bytes / avg_bytes_per_line
+lines_per_chunk     = min(raw_lines_per_chunk, 10000, floor(total_lines / N))
+lines_per_chunk     = max(lines_per_chunk, 1)
 
-Print summary to user: N, lines_per_chunk, coverage_percent, max_chunk_tokens.
+coverage_percent    = (N * lines_per_chunk / total_lines) * 100
+```
 
-If `warnings[]` is non-empty, surface every warning to the user before launching sub-agents.
+Chunk numbering: chunk 1 = oldest (top of file), chunk N = newest (tail). Compute offsets:
 
-If `coverage_percent < 5`, warn the user and suggest a higher N or higher `--context`.
+```
+for i in 1..N:
+    offset[i] = total_lines - (N - i + 1) * lines_per_chunk + 1
+    offset[i] = max(1, offset[i])
+```
 
-## Phase 3: Launch One Sub-Agent Per Chunk
+Chunk 3 is the newest, chunk 1 the oldest within analyzed range.
 
-For each chunk, run exactly one Task call. All N Task calls go into a **single response block** so they execute in parallel.
+Print summary to user: N, lines_per_chunk, analyzed_lines (= N × lines_per_chunk), coverage_percent, context window used.
 
-The procedure per chunk is fully mechanical — there is **no prompt-building step at all**:
+If coverage < 5%, warn the user and suggest a higher N.
 
-1. Take `chunks[i].agent_prompt` as-is from the tool response.
-2. Pass that string directly to the **Task** tool as the sub-agent prompt.
+If `total_lines < N * 100` and N > 1, suggest a lower N.
 
-That's it. Do NOT add to it, summarize it, trim it, paraphrase it, or wrap it in your own instructions. Do NOT replace any placeholders — the tool already did. Each prompt will be large (hundreds of KB or more) — that is expected and required.
+### Step 2c: Read each chunk
 
-Do NOT pass the command template, the skill text, or your own Phase-1/2/3 notes to the sub-agent. The sub-agent must see ONLY `chunks[i].agent_prompt` — nothing else.
+Read every chunk using the **Read** tool. Use parallel Read calls (one per chunk) in a SINGLE response block:
 
-Do NOT call `Read`, `Grep`, or `Bash` on the log file in the orchestrator. The chunk content is already embedded in `agent_prompt`.
+- For each chunk `i`, call `Read(filePath="<LOG_PATH>", offset=<OFFSET>, limit=<LIMIT>)`.
+- The Read output is the raw chunk text. Do not interpret, filter, or summarize it.
+- Store each chunk's text paired with its metadata.
 
-The sub-agents have **zero tool budget**: no Read, no Grep, no Bash, no Glob, no Task, no split_log_chunks. They reason over the embedded text and respond with the structured report described inside `agent_prompt`.
+## Phase 3: Launch One Sub-Agent Per Chunk (Inline at End)
+
+Launch exactly one sub-agent for each chunk. Use the **Task** tool (subagent). All sub-agents in a SINGLE response block for parallel execution.
+
+Each sub-agent prompt has TWO parts, in this exact order:
+1. PROJECT_BRIEFING + chunk metadata + analysis instructions
+2. **At the very end:** the full raw chunk text from Step 2c — pasted verbatim after the `RAW LOG DATA` marker
+
+Sub-agent receives everything inline. ZERO tools.
+
+**Placement matters:** chunk text goes at the END. Instructions first, data after. This prevents the sub-agent from "exploring" before it knows the task.
+
+## Sub-Agent Prompt Template
+
+Build the prompt in this EXACT order: briefing + metadata + instructions first, then the raw chunk text LAST. Replace `{CHUNK_TEXT}` with the Read output from Step 2c — paste verbatim.
+
+```text
+You are a log chunk analyzer. Analyze exactly one chunk of a log file.
+
+Use the user's language for prose in your final answer. Keep log lines, exception names, code identifiers, paths, and technical terms as written.
+
+You have ZERO tools. The entire log chunk is at the end of this prompt. Do not call any tool — Read, Bash, Grep, nothing. Read the inline data, think, output your findings.
+
+Chunk metadata:
+- Chunk: {CHUNK_NUMBER}/{TOTAL_CHUNKS}
+- Ordering: chunk 1 oldest, chunk {TOTAL_CHUNKS} newest
+- Lines: {LIMIT}
+
+PROJECT_BRIEFING:
+---
+{PROJECT_BRIEFING}
+---
+
+Analysis checklist:
+1. Errors and exceptions: ERROR, CRITICAL, Exception, Traceback, failed operations. Group repeated patterns. Count exact occurrences. Capture first/last timestamps.
+2. Warnings and degradation: WARNING lines, retries, timeouts, resource pressure, slow operations.
+3. Logic and workflow integrity: Missing start/end pairs, orphaned operations, contradictory decisions, impossible state transitions vs PROJECT_BRIEFING.
+4. Timing and volume anomalies: Large gaps (>60s), sudden bursts, stalled cycles.
+5. External dependencies: API failures, DB failures, rate limits, connection errors, DNS/TLS errors.
+6. Cross-chunk metrics: Produce structured metrics for orchestrator comparison.
+
+For every finding: exact count (e.g. "14×"), first+last timestamp, 1-2 representative log lines, severity (CRITICAL/MEDIUM/LOW).
+
+Output structure:
+---
+## Chunk {CHUNK_NUMBER}/{TOTAL_CHUNKS}
+**Range:** lines <offset>-<end_line>
+**Time range:** <first> → <last>
+
+### CRITICAL
+- **<title>**: <description, count, timestamps>
+  - Evidence: `<line>`
+  - Expected: <from BRIEFING or N/A>
+  - Root cause: <hypothesis>
+
+### MEDIUM
+(same format)
+
+### LOW
+(same format)
+
+### Chunk Statistics
+- Lines analyzed: <number>
+- Errors: <number>
+- Warnings: <number>
+- Max gap: <seconds or N/A>
+- Active components: <list>
+- Health summary: <sentence>
+
+### Cross-Chunk Signals
+- errors_total: <number>
+- warnings_total: <number>
+- critical_findings_total: <number>
+- medium_findings_total: <number>
+- low_findings_total: <number>
+- max_gap_seconds: <number or N/A>
+- active_components: <list>
+- pattern_counts:
+  - <name>: <count>
+---
+
+If no findings in a section, write `None`.
+Every finding MUST have exact count + first AND last timestamps.
+
+RAW LOG DATA — your assigned chunk:
+---
+{CHUNK_TEXT}
+```
 
 ## Phase 4: Consolidate
 
@@ -137,14 +229,15 @@ Return one report in chat:
 - **Chunks analyzed:** <N>
 - **Lines per chunk:** <lines_per_chunk>
 - **Coverage:** <percent>% of file
-- **Method:** one sub-agent per chunk; sub-agents receive full chunk text inline (no tools)
+- **Context window:** <context_K>K tokens, target <target_chunk_tokens>K tokens per chunk
+- **Method:** one sub-agent per chunk; chunk text inlined at end of prompt (no tools)
 
 ## Project Context Used
 <short summary of briefing sources and key rules>
 
 ## Chunk Summary
-| Chunk | Lines | Time range | Critical | Medium | Low | Status |
-|-------|-------|------------|----------|--------|-----|--------|
+| Chunk | Range (lines) | Time range | Critical | Medium | Low | Status |
+|-------|--------------|------------|----------|--------|-----|--------|
 
 ## Metric Trends
 | Metric | Chunk 1 | Chunk 2 | ... | Chunk N | Trend |

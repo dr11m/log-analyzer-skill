@@ -11,16 +11,31 @@
  */
 import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
-import { join } from "path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+import { readFile, writeFile, stat, mkdir, access } from "node:fs/promises";
 
 // ---------------------------------------------------------------------------
-// Embedded skill & command content
+// Embedded skill & command content (Node fs, no Bun-specific APIs)
 // ---------------------------------------------------------------------------
+
+const PLUGIN_DIR = dirname(fileURLToPath(import.meta.url));
+const PACKAGE_ROOT = join(PLUGIN_DIR, "..");
+
+async function pathExists(p: string): Promise<boolean> {
+  try {
+    await access(p);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 async function readBundledFile(relativePath: string): Promise<string> {
-  const fullPath = join(import.meta.dir, "..", relativePath);
-  const file = Bun.file(fullPath);
-  if (await file.exists()) return file.text();
+  // PLUGIN_DIR points at dist/. Static assets (skills/, commands/, package.json)
+  // live in the package root, one level up.
+  const fullPath = join(PACKAGE_ROOT, relativePath);
+  if (await pathExists(fullPath)) return readFile(fullPath, "utf8");
   throw new Error(`Bundled file not found: ${fullPath}`);
 }
 
@@ -89,16 +104,17 @@ async function bootstrapSkill(
   const skillFile = join(skillDir, "SKILL.md");
   const versionFile = join(skillDir, ".bundle-version");
 
-  if (await Bun.file(skillFile).exists()) {
-    const installedVersion = (await Bun.file(versionFile).exists())
-      ? (await Bun.file(versionFile).text()).trim()
+  if (await pathExists(skillFile)) {
+    const installedVersion = (await pathExists(versionFile))
+      ? (await readFile(versionFile, "utf8")).trim()
       : null;
     if (installedVersion === pluginVersion) return;
   }
 
   const content = await readBundledFile(join("skills", `${skillName}.md`));
-  await Bun.write(skillFile, content, { createPath: true });
-  await Bun.write(versionFile, pluginVersion, { createPath: true });
+  await mkdir(skillDir, { recursive: true });
+  await writeFile(skillFile, content, "utf8");
+  await writeFile(versionFile, pluginVersion, "utf8");
 }
 
 async function bootstrapSkills(cwd: string): Promise<void> {
@@ -306,12 +322,11 @@ Before returning, verify:
       const contextTokens = (args.contextTokens as number | undefined) ?? 200;
       const projectBriefing = (args.projectBriefing as string | undefined) ?? "";
 
-      const file = Bun.file(logPath);
-      if (!(await file.exists())) {
+      if (!(await pathExists(logPath))) {
         return JSON.stringify({ error: `Log file not found: ${logPath}` });
       }
 
-      const totalBytes = file.size;
+      const totalBytes = (await stat(logPath)).size;
       if (totalBytes > MAX_FILE_BYTES) {
         return JSON.stringify({
           error:
@@ -320,7 +335,7 @@ Before returning, verify:
         });
       }
 
-      const text = await file.text();
+      const text = await readFile(logPath, "utf8");
       // Count lines preserving the last empty string from trailing \n
       const lines = text.split("\n");
       const totalLines = lines[lines.length - 1] === "" ? lines.length - 1 : lines.length;

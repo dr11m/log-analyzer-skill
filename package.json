@@ -1,15 +1,19 @@
 {
   "name": "@dr39m/log-analyzer-suite",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "OpenCode plugin for AI-powered log analysis — inductive chunk analysis (log-insight) and deductive source-code-aware validation (log-validate)",
   "type": "module",
-  "main": "src/index.ts",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "files": [
-    "src",
+    "dist",
     "skills",
     "commands",
     "README.md"
   ],
+  "scripts": {
+    "build": "tsc"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",
@@ -24,7 +28,7 @@
     "url": "https://github.com/dr11m/log-analyzer-suite"
   },
   "engines": {
-    "bun": ">=1.0.0"
+    "node": ">=18"
   },
   "publishConfig": {
     "access": "public"
@@ -33,7 +37,7 @@
     "@opencode-ai/plugin": "^1.0.0"
   },
   "devDependencies": {
-    "@types/bun": "^1.0.0",
+    "@types/node": "^20.19.41",
     "typescript": "^5.0.0"
   }
 }
