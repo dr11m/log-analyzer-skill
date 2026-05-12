@@ -6,27 +6,19 @@
 
 ### Для конкретного проекта (рекомендуется)
 
-Добавь в `opencode.json` в корне проекта:
+В корне проекта выполни:
 
-```json
-{
-  "plugin": ["@dr39m/log-analyzer-suite"]
-}
+```powershell
+opencode plugin @dr39m/log-analyzer-suite
 ```
 
-Плагин будет активен **только в этом проекте**. Навыки создадутся в `.opencode/skills/` внутри проекта.
+Это добавит плагин в `opencode.json` и подтянет его из npm.
 
 ### Глобально (для всех проектов)
 
-Добавь в `~/.config/opencode/opencode.json`:
-
-```json
-{
-  "plugin": ["@dr39m/log-analyzer-suite"]
-}
+```powershell
+opencode plugin @dr39m/log-analyzer-suite --global
 ```
-
-Плагин будет активен во всех проектах. Навыки создадутся в `~/.config/opencode/skills/`.
 
 ### Что происходит при первом запуске
 
@@ -36,6 +28,14 @@
 - Добавит тул `split_log_chunks` для расчёта границ чанков
 
 Никаких дополнительных действий не требуется.
+
+## Обновление
+
+```powershell
+opencode plugin @dr39m/log-analyzer-suite --force
+```
+
+Флаг `--force` (`-f`) заставляет opencode переустановить плагин поверх закешированной версии. Навыки в `.opencode/skills/SKILL.md` автоматически перезапишутся, потому что начиная с 1.0.6 плагин хранит рядом со скилом файл `.bundle-version` и сверяет версию при запуске.
 
 ## Использование
 

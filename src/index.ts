@@ -66,25 +66,47 @@ function parseFrontmatter(content: string): {
 }
 
 // ---------------------------------------------------------------------------
-// Skill bootstrapper
+// Skill bootstrapper (version-aware)
+//
+// Writes a sidecar `.bundle-version` next to each SKILL.md. On startup, if the
+// installed version does not match the bundled plugin version, SKILL.md is
+// rewritten. This lets `opencode plugin <name> --force` update both the tool
+// code AND the skill in one step, without users having to delete .opencode/.
 // ---------------------------------------------------------------------------
+
+async function readBundledPluginVersion(): Promise<string> {
+  const pkgText = await readBundledFile("package.json");
+  const pkg = JSON.parse(pkgText) as { version?: string };
+  return pkg.version ?? "0.0.0";
+}
 
 async function bootstrapSkill(
   skillName: string,
   skillsDir: string,
+  pluginVersion: string,
 ): Promise<void> {
-  const skillFile = join(skillsDir, skillName, "SKILL.md");
-  if (await Bun.file(skillFile).exists()) return;
+  const skillDir = join(skillsDir, skillName);
+  const skillFile = join(skillDir, "SKILL.md");
+  const versionFile = join(skillDir, ".bundle-version");
+
+  if (await Bun.file(skillFile).exists()) {
+    const installedVersion = (await Bun.file(versionFile).exists())
+      ? (await Bun.file(versionFile).text()).trim()
+      : null;
+    if (installedVersion === pluginVersion) return;
+  }
 
   const content = await readBundledFile(join("skills", `${skillName}.md`));
   await Bun.write(skillFile, content, { createPath: true });
+  await Bun.write(versionFile, pluginVersion, { createPath: true });
 }
 
 async function bootstrapSkills(cwd: string): Promise<void> {
   const skillsDir = join(cwd, ".opencode", "skills");
+  const pluginVersion = await readBundledPluginVersion();
   await Promise.all([
-    bootstrapSkill("log-insight", skillsDir),
-    bootstrapSkill("log-validate", skillsDir),
+    bootstrapSkill("log-insight", skillsDir, pluginVersion),
+    bootstrapSkill("log-validate", skillsDir, pluginVersion),
   ]);
 }
 
