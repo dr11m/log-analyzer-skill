@@ -9,15 +9,15 @@
 В корне проекта выполни:
 
 ```powershell
-opencode plugin @dr39m/log-analyzer-suite
+opencode plugin @dr39m/log-analyzer-suite@latest
 ```
 
-Это добавит плагин в `opencode.json` и подтянет его из npm.
+Это добавит плагин в `.opencode/opencode.json` и подтянет его из npm.
 
 ### Глобально (для всех проектов)
 
 ```powershell
-opencode plugin @dr39m/log-analyzer-suite --global
+opencode plugin @dr39m/log-analyzer-suite@latest --global
 ```
 
 ### Что происходит при первом запуске
@@ -32,10 +32,12 @@ opencode plugin @dr39m/log-analyzer-suite --global
 ## Обновление
 
 ```powershell
-opencode plugin @dr39m/log-analyzer-suite --force
+opencode plugin @dr39m/log-analyzer-suite@latest --force
 ```
 
-Флаг `--force` (`-f`) заставляет opencode переустановить плагин поверх закешированной версии. Навыки в `.opencode/skills/SKILL.md` автоматически перезапишутся, потому что начиная с 1.0.6 плагин хранит рядом со скилом файл `.bundle-version` и сверяет версию при запуске.
+**Важно про суффикс `@latest`.** Без него `--force` подтягивает не свежую версию с npm, а перетягивает ту, что уже зафиксирована во внутреннем lock-файле opencode'а. Суффикс `@latest` явно говорит opencode'у пересчитать тег и взять актуальную версию из npm.
+
+Навыки в `.opencode/skills/<name>/SKILL.md` обновляются автоматически: начиная с 1.0.6 плагин пишет рядом со скиллом файл `.bundle-version` и при каждом запуске сравнивает с встроенной версией. При расхождении SKILL.md перезаписывается.
 
 ## Использование
 
