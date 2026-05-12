@@ -86,20 +86,35 @@ If `coverage_percent < 5`, warn the user and suggest a higher N or higher `--con
 
 ## Phase 3: Launch One Sub-Agent Per Chunk
 
-For each chunk, run exactly one Task call. All N Task calls go into a **single response block** so they execute in parallel.
+Principle: **"split — pass through"**. The tool already did the splitting. Your only job is to forward each chunk verbatim.
 
-The procedure per chunk is fully mechanical — there is **no prompt-building step at all**:
+For each chunk `i`:
+1. Take `chunks[i].agent_prompt` from the tool response.
+2. Pass that string as the prompt to the **Task** tool. One Task call = one string from the tool. Nothing else.
 
-1. Take `chunks[i].agent_prompt` as-is from the tool response.
-2. Pass that string directly to the **Task** tool as the sub-agent prompt.
+All N Task calls must go into a **single response block** so they execute in parallel.
 
-That's it. Do NOT add to it, summarize it, trim it, paraphrase it, or wrap it in your own instructions. Do NOT replace any placeholders — the tool already did. Each prompt will be large (hundreds of KB or more) — that is expected and required.
+### Forbidden manipulations between `split_log_chunks` and `Task`
 
-Do NOT pass the command template, the skill text, or your own Phase-1/2/3 notes to the sub-agent. The sub-agent must see ONLY `chunks[i].agent_prompt` — nothing else.
+These are the actions the model often "feels like" doing but they BREAK the analysis. Each bullet corresponds to a real failure mode we have observed:
 
-Do NOT call `Read`, `Grep`, or `Bash` on the log file in the orchestrator. The chunk content is already embedded in `agent_prompt`.
+- ❌ **Do NOT save** `chunks[i].agent_prompt` to a file via `Bash`, `Write`, `Edit`, or any other tool. The content does not need to live on disk.
+- ❌ **Do NOT split** `chunks[i].agent_prompt` into segments (40 KB chunks, line ranges, base64 fragments, anything). The tool already produced the only segmentation that matters.
+- ❌ **Do NOT replace** the inline content with "Read this file at offset/limit" instructions to the sub-agent. The content is already embedded — the sub-agent must NOT read anything.
+- ❌ **Do NOT shell out** to Python, PowerShell, Node, Bash one-liners, or any interpreter to "preprocess" the prompt before Task.
+- ❌ **Do NOT shorten, summarize, paraphrase, or excerpt** `agent_prompt`. The tool returned exactly what should go into Task.
+- ❌ **Do NOT substitute placeholders** — there are none left. The tool already substituted `{PROJECT_BRIEFING}` because you passed `projectBriefing` to the tool.
+- ❌ **Do NOT decide** "this string is too large, the sub-agent can't handle it". That is an incorrect assumption — see below.
 
-The sub-agents have **zero tool budget**: no Read, no Grep, no Bash, no Glob, no Task, no split_log_chunks. They reason over the embedded text and respond with the structured report described inside `agent_prompt`.
+### About the size
+
+If `chunks[i].agent_prompt.length` looks large (200 KB – 1 MB) — that is the **correct** size. The tool sized it under the sub-agent's context window (`contextTokens × 1000 × 0.70` tokens). Just pass it through.
+
+If YOU (the orchestrator) genuinely cannot send the string (e.g. your own context window cannot hold N parallel Task prompts of this size) — that is a signal to **STOP and tell the user**: "Current model cannot fit N × {size} KB of parallel Task prompts. Use a model with a larger context window, or lower `--context`/`--chunks`." Do **NOT** work around it via files/segments/Read — that gives a wrong analysis because sub-agents see truncated data.
+
+### Sub-agent constraints (informational — described inside `agent_prompt` too)
+
+The sub-agents have **zero tool budget**: no Read, no Grep, no Bash, no Glob, no Task, no split_log_chunks. They reason over the inline embedded chunk and respond with the structured report described inside `agent_prompt`.
 
 ## Phase 4: Consolidate
 
