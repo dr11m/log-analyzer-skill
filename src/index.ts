@@ -251,12 +251,17 @@ Before returning, verify:
     byteSize: number,
     lineCount: number,
     chunkContent: string,
+    projectBriefing: string,
   ): string {
+    const briefingBlock = projectBriefing.length > 0
+      ? projectBriefing
+      : "{PROJECT_BRIEFING}";
     return SUBAGENT_PROMPT_TEMPLATE
       .replaceAll("__CHUNK_NUMBER__", String(chunkNumber))
       .replaceAll("__TOTAL_CHUNKS__", String(totalChunks))
       .replaceAll("__BYTE_SIZE__", String(byteSize))
       .replaceAll("__LINE_COUNT__", String(lineCount))
+      .replace("{PROJECT_BRIEFING}", briefingBlock)
       .replace("__CHUNK_CONTENT__", chunkContent);
   }
 
@@ -285,11 +290,21 @@ Before returning, verify:
           "Default: 200. Each chunk is capped at contextTokens * 1000 * 0.70 tokens, " +
           "estimated as bytes / 3.5.",
         ),
+      projectBriefing: tool.schema
+        .string()
+        .optional()
+        .describe(
+          "Project briefing text built in Phase 1 (architecture notes, business rules, etc.). " +
+          "If provided, the tool inlines it into each chunks[i].agent_prompt so the orchestrator " +
+          "can forward the prompt to Task as-is, with NO further string substitution. " +
+          "If omitted, agent_prompt keeps a {PROJECT_BRIEFING} placeholder for backward compatibility.",
+        ),
     },
     async execute(args, _ctx) {
       const logPath = args.logPath as string;
       const requestedChunks = args.chunks as number;
       const contextTokens = (args.contextTokens as number | undefined) ?? 200;
+      const projectBriefing = (args.projectBriefing as string | undefined) ?? "";
 
       const file = Bun.file(logPath);
       if (!(await file.exists())) {
@@ -364,7 +379,7 @@ Before returning, verify:
           byte_size: byteSize,
           line_count: lineCount,
           est_tokens: Math.round(byteSize / BYTES_PER_TOKEN),
-          agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, content),
+          agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, content, projectBriefing),
         });
       }
 

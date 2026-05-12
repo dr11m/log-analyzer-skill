@@ -14,9 +14,9 @@ Parse `$ARGUMENTS` as flags (order does not matter):
 If `--chunks` is missing, ask the user.
 
 Follow the log-insight skill workflow:
-1. Build PROJECT_BRIEFING from project documentation (`AGENTS.md`, `CLAUDE.md`, `docs/*.md`, `README.md`).
-2. Invoke the **native opencode tool** `split_log_chunks` (registered by this plugin — call it like you call `Read`, `Grep`, `Bash`; it is NOT a shell command or Python script) with arguments `logPath`, `chunks`, `contextTokens`. If the tool is not in your tool list, the plugin is not loaded — STOP and tell the user. Do NOT improvise by splitting the file via `Bash`/`Read`/`Python`.
-3. The tool returns each chunk as a ready-to-send sub-agent prompt in `chunks[i].agent_prompt` (raw log content already embedded). Surface any `warnings[]` from the tool to the user before dispatching sub-agents.
-4. For each chunk, take `chunks[i].agent_prompt`, replace `{PROJECT_BRIEFING}` with the briefing text, and pass the result to the Task tool. Launch all N sub-agents in a single response block for parallel execution. Sub-agents have zero tool budget (no Read, no Grep, no Bash).
+1. Build PROJECT_BRIEFING from project documentation (`AGENTS.md`, `CLAUDE.md`, `docs/*.md`, `README.md`). Keep the briefing text in a variable — you will pass it to the tool below.
+2. Invoke the **native opencode tool** `split_log_chunks` (registered by this plugin — call it like you call `Read`, `Grep`, `Bash`; it is NOT a shell command or Python script) with arguments `logPath`, `chunks`, `contextTokens`, AND `projectBriefing` (the full briefing text from step 1). If the tool is not in your tool list, the plugin is not loaded — STOP and tell the user. Do NOT improvise by splitting the file via `Bash`/`Read`/`Python`.
+3. The tool returns each chunk as a fully self-contained sub-agent prompt in `chunks[i].agent_prompt` (raw log content AND project briefing already embedded). Surface any `warnings[]` to the user before dispatching sub-agents.
+4. For each chunk: take `chunks[i].agent_prompt` from the tool response and pass it directly to the Task tool as the sub-agent prompt — verbatim, no edits, no extra instructions, no replacements. Launch all N Task calls in a single response block so they run in parallel. Sub-agents have zero tool budget (no Read, no Grep, no Bash, no split_log_chunks).
 5. Consolidate findings into a trend-aware report with CRITICAL/MEDIUM/LOW severity.
 6. Output the final report in the user's language.

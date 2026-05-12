@@ -62,8 +62,9 @@ Parameters:
 - `logPath` (string, required) — absolute path to the log file.
 - `chunks` (number, required) — N from the user's `--chunks` flag.
 - `contextTokens` (number, optional, default 200) — K from the user's `--context` flag, in thousands of tokens.
+- `projectBriefing` (string, required for the workflow to work without manual substitution) — pass the full PROJECT_BRIEFING text you built in Phase 1. The tool inlines it into each `chunks[i].agent_prompt`, so the orchestrator does NOT have to do any string replacement.
 
-The tool loads the file, slices it into N equal chunks from the END of the file, and **returns a fully-rendered sub-agent prompt for each chunk** with the raw log content already embedded.
+The tool loads the file, slices it into N equal chunks from the END of the file, and **returns a fully-rendered sub-agent prompt for each chunk** with both the raw log content AND the project briefing already embedded.
 
 The tool returns JSON with:
 - `total_lines`, `total_bytes` — file size
@@ -75,7 +76,7 @@ The tool returns JSON with:
 
 Chunks are numbered oldest to newest. Chunk 1 = oldest analyzed portion, Chunk N = newest (file tail).
 
-**Do NOT read the log file yourself. Do NOT build the sub-agent prompt yourself.** Each `chunks[i].agent_prompt` is already a complete Task prompt — it contains the analysis instructions, chunk metadata, the full raw log content, and the output template. The only placeholder left in it is `{PROJECT_BRIEFING}`, which you replace once before sending.
+**Do NOT read the log file yourself. Do NOT build the sub-agent prompt yourself. Do NOT modify `chunks[i].agent_prompt` in any way.** Each `chunks[i].agent_prompt` is already a complete Task prompt — it contains the analysis instructions, chunk metadata, the project briefing (because you passed `projectBriefing` to the tool), the full raw log content, and the output template. There are NO placeholders left to fill — just pass the string to the Task tool verbatim.
 
 Print summary to user: N, lines_per_chunk, coverage_percent, max_chunk_tokens.
 
@@ -87,15 +88,18 @@ If `coverage_percent < 5`, warn the user and suggest a higher N or higher `--con
 
 For each chunk, run exactly one Task call. All N Task calls go into a **single response block** so they execute in parallel.
 
-The procedure per chunk is mechanical — there is no creative prompt-building step:
+The procedure per chunk is fully mechanical — there is **no prompt-building step at all**:
 
 1. Take `chunks[i].agent_prompt` as-is from the tool response.
-2. Do a single string replacement: `{PROJECT_BRIEFING}` → the briefing text you built in Phase 1.
-3. Send the resulting string to the **Task** tool as the sub-agent prompt. Do NOT add to it, summarize it, or trim it. Each prompt will be large (hundreds of KB or more) — that is expected.
+2. Pass that string directly to the **Task** tool as the sub-agent prompt.
 
-Do NOT call `Read`, `Grep`, or `Bash` on the log file in the orchestrator. Do NOT pass `offset`, `limit`, or a file path to the sub-agent. The chunk content is already embedded in `agent_prompt`.
+That's it. Do NOT add to it, summarize it, trim it, paraphrase it, or wrap it in your own instructions. Do NOT replace any placeholders — the tool already did. Each prompt will be large (hundreds of KB or more) — that is expected and required.
 
-The sub-agents have **zero tool budget**: no Read, no Grep, no Bash, no Glob, no Task. They reason over the embedded text and respond with the structured report described inside `agent_prompt`.
+Do NOT pass the command template, the skill text, or your own Phase-1/2/3 notes to the sub-agent. The sub-agent must see ONLY `chunks[i].agent_prompt` — nothing else.
+
+Do NOT call `Read`, `Grep`, or `Bash` on the log file in the orchestrator. The chunk content is already embedded in `agent_prompt`.
+
+The sub-agents have **zero tool budget**: no Read, no Grep, no Bash, no Glob, no Task, no split_log_chunks. They reason over the embedded text and respond with the structured report described inside `agent_prompt`.
 
 ## Phase 4: Consolidate
 
