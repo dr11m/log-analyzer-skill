@@ -109,22 +109,22 @@ All N Task calls must go into a **single response block** so they execute in par
 
 ### What the orchestrator passes vs what sub-agents do
 
-`chunks[i].agent_prompt` is small (~15–50 KB) — it does NOT contain the raw log. It contains PROJECT_BRIEFING + analysis instructions + a single line:
+`chunks[i].agent_prompt` is small (~15-50 KB) -- it does NOT contain the raw log. It contains PROJECT_BRIEFING + analysis instructions + a single line:
 ```
-Read(filePath="<absolute path>", offset=N, limit=M)
+Bash(command="cat <chunk_file_path>")
 ```
 
-Each sub-agent makes **EXACTLY ONE** Read tool call with the supplied offset/limit. That single Read returns the full chunk (because `tool_output` in `opencode.json` has lifted the default truncation cap). Then the sub-agent reasons over the read content and produces the structured report.
+Each sub-agent makes **EXACTLY ONE** Bash tool call to `cat` its chunk file. That single Bash returns the full chunk (because `tool_output` in `opencode.json` has `max_bytes >= 8 MB`, bypassing the Read tool's internal 50KB cap). Then the sub-agent reasons over the output and produces the structured report.
 
 ### Forbidden manipulations (between split_log_chunks and Task)
 
-- ❌ Do NOT save `chunks[i].agent_prompt` to a file, do NOT split it into segments, do NOT shell out to Python/PowerShell/Node.
-- ❌ Do NOT modify the `Read(...)` line in `agent_prompt` (offset/limit are pre-computed by the tool).
-- ❌ Do NOT substitute placeholders — there are none left, the tool inlined `{PROJECT_BRIEFING}` when you called it with `projectBriefing`.
+- Do NOT save `chunks[i].agent_prompt` to a file, do NOT split it into segments, do NOT shell out to Python/PowerShell/Node.
+- Do NOT modify the `Bash(...)` line in `agent_prompt` (chunk_file paths are pre-computed by the tool).
+- Do NOT substitute placeholders -- there are none left, the tool inlined `{PROJECT_BRIEFING}` when you called it with `projectBriefing`.
 
 ### Sub-agent constraints (also stated inside agent_prompt)
 
-The sub-agents have a **tool budget of exactly ONE Read call**. No Grep, no Bash, no Glob, no Task, no further Read'ы. The single Read with the pre-supplied offset/limit fetches the whole chunk; everything else is pure reasoning over the Read result.
+The sub-agents have a **tool budget of exactly ONE Bash call**. No Read, no Grep, no Glob, no Task, no further Bash calls. The single `cat` fetches the whole chunk; everything else is pure reasoning over the Bash output.
 
 ## Phase 4: Consolidate
 

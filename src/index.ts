@@ -13,7 +13,7 @@ import type { Plugin } from "@opencode-ai/plugin";
 import { tool } from "@opencode-ai/plugin";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { readFile, writeFile, stat, mkdir, access } from "node:fs/promises";
+import { readFile, writeFile, stat, mkdir, rm, access } from "node:fs/promises";
 
 // ---------------------------------------------------------------------------
 // Embedded skill & command content (Node fs, no Bun-specific APIs)
@@ -160,17 +160,18 @@ export const LogAnalyzerSuite: Plugin = async ({ directory, client }) => {
   const BYTES_PER_TOKEN = 3.5; // conservative estimate for mixed-content logs
   const CHUNK_BUDGET_RATIO = 0.7; // each chunk fills up to 70% of context window
 
-  // Sub-agent prompt template. The tool fills CHUNK_NUMBER/TOTAL/BYTE_SIZE/LINE_COUNT/LOG_PATH/OFFSET/LIMIT/OFFSET_END
-  // for every chunk and returns the result as chunks[i].agent_prompt. The sub-agent makes
-  // EXACTLY ONE Read call with the supplied offset/limit. Requires opencode `tool_output`
-  // override in opencode.json so the Read response is not truncated.
+  // Sub-agent prompt template. The tool writes each chunk to a temp file and fills
+  // CHUNK_NUMBER/TOTAL/BYTE_SIZE/LINE_COUNT/CHUNK_FILE/OFFSET/OFFSET_END in agent_prompt.
+  // The sub-agent makes EXACTLY ONE Bash call (cat <chunk_file>) to fetch its chunk.
+  // Bash output goes through tool_output config (max_bytes) — NOT subject to the
+  // Read tool's internal 50KB cap. Requires tool_output override in opencode.json.
   const SUBAGENT_PROMPT_TEMPLATE = `You are a log chunk analyzer. Analyze exactly one chunk of a log file.
 Use the user's language for prose in your final answer. Keep log lines, exception names, code identifiers, paths, and technical terms as written.
 
 Hard tool rules:
-- You may make EXACTLY ONE tool call: Read(filePath="__LOG_PATH__", offset=__OFFSET__, limit=__LIMIT__). That single Read returns the FULL chunk because the user's opencode.json has tool_output configured to lift the default truncation cap.
-- After that one Read: ZERO further tool calls. Do NOT call Read again, do NOT call Bash/Grep/Glob/Task/Write/any other tool. Do NOT loop, do NOT shell out.
-- If the Read returns fewer than __LINE_COUNT__ lines, report that exact fact in your output ("Read returned only N of __LINE_COUNT__ lines — tool_output likely not configured") and analyze whatever you got. Do NOT retry.
+- You may make EXACTLY ONE tool call: Bash(command="cat __CHUNK_FILE__"). That single Bash returns the FULL chunk because the user's opencode.json has tool_output.max_bytes set high enough (>= 8 MB).
+- After that one Bash: ZERO further tool calls. Do NOT call Bash again, do NOT call Read/Grep/Glob/Task/Write/any other tool. Do NOT loop, do NOT shell out.
+- If the Bash output has fewer than __LINE_COUNT__ lines, report that exact fact in your output ("Bash returned only N of __LINE_COUNT__ lines — tool_output likely not configured") and analyze whatever you got. Do NOT retry.
 
 Purpose:
 This is inductive log analysis. You must reason from the complete chunk content, not from filtered matches. Compare observed behavior against the project rules and expected runtime flow.
@@ -186,10 +187,10 @@ PROJECT_BRIEFING:
 {PROJECT_BRIEFING}
 ---
 
-YOUR LOG CHUNK — fetch it now with ONE Read call:
-    Read(filePath="__LOG_PATH__", offset=__OFFSET__, limit=__LIMIT__)
+YOUR LOG CHUNK — fetch it now with ONE Bash call:
+    Bash(command="cat __CHUNK_FILE__")
 
-That single Read returns lines __OFFSET__ through __OFFSET_END__ — chunk __CHUNK_NUMBER__/__TOTAL_CHUNKS__, __LINE_COUNT__ lines / __BYTE_SIZE__ bytes total.
+That single Bash returns lines __OFFSET__ through __OFFSET_END__ — chunk __CHUNK_NUMBER__/__TOTAL_CHUNKS__, __LINE_COUNT__ lines / __BYTE_SIZE__ bytes total.
 
 Analysis checklist:
 1. Errors and exceptions:
@@ -266,9 +267,8 @@ Before returning, verify:
     totalChunks: number,
     byteSize: number,
     lineCount: number,
-    logPath: string,
+    chunkFile: string,
     offset: number,
-    limit: number,
     projectBriefing: string,
   ): string {
     const briefingBlock = projectBriefing.length > 0
@@ -280,10 +280,9 @@ Before returning, verify:
       .replaceAll("__TOTAL_CHUNKS__", String(totalChunks))
       .replaceAll("__BYTE_SIZE__", String(byteSize))
       .replaceAll("__LINE_COUNT__", String(lineCount))
-      .replaceAll("__LOG_PATH__", logPath.replace(/\\/g, "\\\\"))
+      .replaceAll("__CHUNK_FILE__", chunkFile.replace(/\\/g, "/"))
       .replaceAll("__OFFSET__", String(offset))
       .replaceAll("__OFFSET_END__", String(offsetEnd))
-      .replaceAll("__LIMIT__", String(limit))
       .replace("{PROJECT_BRIEFING}", briefingBlock);
   }
 
@@ -293,11 +292,12 @@ Before returning, verify:
       "Chunks are sliced from the END of the file (newest data first) so the most recent " +
       "lines are always covered. Each chunk is sized to ~70% of the model context window. " +
       "Chunk 1 = oldest analyzed slice, Chunk N = newest (file tail). " +
-      "Each chunks[i].agent_prompt is a compact Task prompt (~15-50 KB) containing PROJECT_BRIEFING + " +
-      "analysis instructions + a ONE-line Read(filePath, offset, limit) directive. The sub-agent makes " +
-      "exactly one Read call to fetch its chunk and then analyzes it. " +
-      "REQUIRES tool_output override in opencode.json (max_bytes ≥ chunk size) so the sub-agent's Read " +
-      "is not truncated. Without that override, sub-agents will get partial chunks.",
+      "Each chunk is written to a temp file under .opencode/chunks/ and chunks[i].agent_prompt " +
+      "is a compact Task prompt (~15-50 KB) containing PROJECT_BRIEFING + analysis instructions + " +
+      "a ONE-line Bash(cat) directive. The sub-agent makes exactly one Bash call to fetch its chunk " +
+      "and then analyzes it. REQUIRES tool_output override in opencode.json (max_bytes >= 8 MB) " +
+      "so the sub-agent's Bash output is not truncated. Without that override, sub-agents will get " +
+      "partial chunks.",
     args: {
       logPath: tool.schema
         .string()
@@ -387,24 +387,39 @@ Before returning, verify:
         );
       }
 
+      // Write chunks to temp files under .opencode/chunks/ so sub-agents can
+      // cat them via Bash (Bash output goes through tool_output, no 50KB Read cap).
+      const chunksDir = join(directory, ".opencode", "chunks");
+      await mkdir(chunksDir, { recursive: true });
+
+      // Clean up old chunk files from previous runs
+      try { await rm(chunksDir, { recursive: true }); } catch { /* ignore */ }
+      await mkdir(chunksDir, { recursive: true });
+
       const manifestChunks: Record<string, unknown>[] = [];
       for (let i = 1; i <= requestedChunks; i++) {
         const rawOffset = totalLines - (requestedChunks - i + 1) * linesPerChunk + 1;
         const offset = Math.max(1, rawOffset);
         const chunkLines = lines.slice(offset - 1, offset - 1 + linesPerChunk);
-        const chunkText = chunkLines.join("\n");
+        // Sanitize: strip ANSI escape codes and C0 control chars (except \n \r \t).
+        // Reason: sub-agent Bash cat output goes through tool_output JSON serialization.
+        // Unprintable control bytes and unescaped escape sequences can cause issues.
+        const chunkText = chunkLines.join("\n")
+          .replace(/\x1B\[[0-9;]*[A-Za-z]/g, "")       // ANSI CSI escape codes
+          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ""); // C0 controls + DEL, keep \n \r \t
         const byteSize = Buffer.byteLength(chunkText, "utf8");
         const lineCount = chunkLines.length;
-        const limit = lineCount;
+        const chunkFile = join(chunksDir, `chunk_${i}.log`);
+        await writeFile(chunkFile, chunkText, "utf8");
         manifestChunks.push({
           number: i,
           total: requestedChunks,
           offset,
-          limit,
           byte_size: byteSize,
           line_count: lineCount,
+          chunk_file: chunkFile,
           est_tokens: Math.round(byteSize / BYTES_PER_TOKEN),
-          agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, logPath, offset, limit, projectBriefing),
+          agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, chunkFile, offset, projectBriefing),
         });
       }
 
