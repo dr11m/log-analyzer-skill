@@ -385,7 +385,14 @@ Before returning, verify:
         const rawOffset = totalLines - (requestedChunks - i + 1) * linesPerChunk + 1;
         const offset = Math.max(1, rawOffset);
         const chunkLines = lines.slice(offset - 1, offset - 1 + linesPerChunk);
-        const content = chunkLines.join("\n");
+        const rawContent = chunkLines.join("\n");
+        // Sanitize: strip ANSI escape codes and C0 control chars (except \n \r \t).
+        // Reason: LLM tool calls are serialized as JSON. Unprintable control bytes
+        // and unescaped escape sequences cause "JSON parsing failed" on the Task
+        // tool side when the orchestrator forwards chunks[i].agent_prompt.
+        const content = rawContent
+          .replace(/\x1B\[[0-9;]*[A-Za-z]/g, "")   // ANSI CSI escape codes
+          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ""); // C0 controls + DEL, keep \n \r \t
         const byteSize = Buffer.byteLength(content, "utf8");
         const lineCount = chunkLines.length;
         manifestChunks.push({
