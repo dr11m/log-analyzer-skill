@@ -160,24 +160,24 @@ export const LogAnalyzerSuite: Plugin = async ({ directory, client }) => {
   const BYTES_PER_TOKEN = 3.5; // conservative estimate for mixed-content logs
   const CHUNK_BUDGET_RATIO = 0.7; // each chunk fills up to 70% of context window
 
-  // Sub-agent prompt template. The tool fills CHUNK_NUMBER/TOTAL/BYTE_SIZE/LINE_COUNT/CONTENT
-  // for every chunk and returns the result as chunks[i].agent_prompt. The orchestrator only
-  // has to replace {PROJECT_BRIEFING} once and forward the string to the Task tool — no
-  // offsets, no Read tool calls, no further templating.
+  // Sub-agent prompt template. The tool fills CHUNK_NUMBER/TOTAL/BYTE_SIZE/LINE_COUNT/LOG_PATH/OFFSET/LIMIT/OFFSET_END
+  // for every chunk and returns the result as chunks[i].agent_prompt. The sub-agent makes
+  // EXACTLY ONE Read call with the supplied offset/limit. Requires opencode `tool_output`
+  // override in opencode.json so the Read response is not truncated.
   const SUBAGENT_PROMPT_TEMPLATE = `You are a log chunk analyzer. Analyze exactly one chunk of a log file.
 Use the user's language for prose in your final answer. Keep log lines, exception names, code identifiers, paths, and technical terms as written.
 
 Hard tool rules:
-- You have ZERO tool budget. The complete log chunk is embedded inline in the LOG_CHUNK_CONTENT section below.
-- Do NOT call Read, Grep, Bash, Glob, Task, or any other tool. There is no file to read — the content is already in this message.
-- Do NOT open files, do NOT search, do NOT shell out. Everything you need is in this prompt.
-- This is a pure reasoning task: read the inline content, think, output the structured result.
+- You may make EXACTLY ONE tool call: Read(filePath="__LOG_PATH__", offset=__OFFSET__, limit=__LIMIT__). That single Read returns the FULL chunk because the user's opencode.json has tool_output configured to lift the default truncation cap.
+- After that one Read: ZERO further tool calls. Do NOT call Read again, do NOT call Bash/Grep/Glob/Task/Write/any other tool. Do NOT loop, do NOT shell out.
+- If the Read returns fewer than __LINE_COUNT__ lines, report that exact fact in your output ("Read returned only N of __LINE_COUNT__ lines — tool_output likely not configured") and analyze whatever you got. Do NOT retry.
 
 Purpose:
 This is inductive log analysis. You must reason from the complete chunk content, not from filtered matches. Compare observed behavior against the project rules and expected runtime flow.
 
 Chunk metadata:
 - Chunk: __CHUNK_NUMBER__/__TOTAL_CHUNKS__
+- File range: lines __OFFSET__ to __OFFSET_END__
 - Size: __BYTE_SIZE__ bytes, __LINE_COUNT__ lines
 - Ordering: chunk 1 is the oldest analyzed chunk, chunk __TOTAL_CHUNKS__ is the newest.
 
@@ -186,10 +186,10 @@ PROJECT_BRIEFING:
 {PROJECT_BRIEFING}
 ---
 
-LOG_CHUNK_CONTENT (full text of this chunk, __BYTE_SIZE__ bytes, __LINE_COUNT__ lines — analyze this directly, do not look anywhere else):
----
-__CHUNK_CONTENT__
----
+YOUR LOG CHUNK — fetch it now with ONE Read call:
+    Read(filePath="__LOG_PATH__", offset=__OFFSET__, limit=__LIMIT__)
+
+That single Read returns lines __OFFSET__ through __OFFSET_END__ — chunk __CHUNK_NUMBER__/__TOTAL_CHUNKS__, __LINE_COUNT__ lines / __BYTE_SIZE__ bytes total.
 
 Analysis checklist:
 1. Errors and exceptions:
@@ -266,31 +266,38 @@ Before returning, verify:
     totalChunks: number,
     byteSize: number,
     lineCount: number,
-    chunkContent: string,
+    logPath: string,
+    offset: number,
+    limit: number,
     projectBriefing: string,
   ): string {
     const briefingBlock = projectBriefing.length > 0
       ? projectBriefing
       : "{PROJECT_BRIEFING}";
+    const offsetEnd = offset + lineCount - 1;
     return SUBAGENT_PROMPT_TEMPLATE
       .replaceAll("__CHUNK_NUMBER__", String(chunkNumber))
       .replaceAll("__TOTAL_CHUNKS__", String(totalChunks))
       .replaceAll("__BYTE_SIZE__", String(byteSize))
       .replaceAll("__LINE_COUNT__", String(lineCount))
-      .replace("{PROJECT_BRIEFING}", briefingBlock)
-      .replace("__CHUNK_CONTENT__", chunkContent);
+      .replaceAll("__LOG_PATH__", logPath.replace(/\\/g, "\\\\"))
+      .replaceAll("__OFFSET__", String(offset))
+      .replaceAll("__OFFSET_END__", String(offsetEnd))
+      .replaceAll("__LIMIT__", String(limit))
+      .replace("{PROJECT_BRIEFING}", briefingBlock);
   }
 
   const splitLogChunksTool = tool({
     description:
-      "Split a log file into N equal chunks and return a fully-rendered sub-agent prompt for each chunk. " +
+      "Split a log file into N equal chunks and return a ready-to-send sub-agent prompt for each chunk. " +
       "Chunks are sliced from the END of the file (newest data first) so the most recent " +
-      "lines are always covered. Each chunk is capped at ~70% of the model context window " +
-      "to leave room for PROJECT_BRIEFING and the sub-agent's response. " +
+      "lines are always covered. Each chunk is sized to ~70% of the model context window. " +
       "Chunk 1 = oldest analyzed slice, Chunk N = newest (file tail). " +
-      "Each chunks[i].agent_prompt is a ready-to-send Task prompt with the raw log content already embedded — " +
-      "the orchestrator only needs to substitute {PROJECT_BRIEFING} and forward the string to Task. " +
-      "Sub-agents do NOT use Read/Grep on the log file.",
+      "Each chunks[i].agent_prompt is a compact Task prompt (~15-50 KB) containing PROJECT_BRIEFING + " +
+      "analysis instructions + a ONE-line Read(filePath, offset, limit) directive. The sub-agent makes " +
+      "exactly one Read call to fetch its chunk and then analyzes it. " +
+      "REQUIRES tool_output override in opencode.json (max_bytes ≥ chunk size) so the sub-agent's Read " +
+      "is not truncated. Without that override, sub-agents will get partial chunks.",
     args: {
       logPath: tool.schema
         .string()
@@ -385,23 +392,19 @@ Before returning, verify:
         const rawOffset = totalLines - (requestedChunks - i + 1) * linesPerChunk + 1;
         const offset = Math.max(1, rawOffset);
         const chunkLines = lines.slice(offset - 1, offset - 1 + linesPerChunk);
-        const rawContent = chunkLines.join("\n");
-        // Sanitize: strip ANSI escape codes and C0 control chars (except \n \r \t).
-        // Reason: LLM tool calls are serialized as JSON. Unprintable control bytes
-        // and unescaped escape sequences cause "JSON parsing failed" on the Task
-        // tool side when the orchestrator forwards chunks[i].agent_prompt.
-        const content = rawContent
-          .replace(/\x1B\[[0-9;]*[A-Za-z]/g, "")   // ANSI CSI escape codes
-          .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, ""); // C0 controls + DEL, keep \n \r \t
-        const byteSize = Buffer.byteLength(content, "utf8");
+        const chunkText = chunkLines.join("\n");
+        const byteSize = Buffer.byteLength(chunkText, "utf8");
         const lineCount = chunkLines.length;
+        const limit = lineCount;
         manifestChunks.push({
           number: i,
           total: requestedChunks,
+          offset,
+          limit,
           byte_size: byteSize,
           line_count: lineCount,
           est_tokens: Math.round(byteSize / BYTES_PER_TOKEN),
-          agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, content, projectBriefing),
+          agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, logPath, offset, limit, projectBriefing),
         });
       }
 

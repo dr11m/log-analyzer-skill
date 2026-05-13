@@ -101,35 +101,30 @@ If `coverage_percent < 5`, warn the user and suggest a higher N or higher `--con
 
 ## Phase 3: Launch One Sub-Agent Per Chunk
 
-Principle: **"split — pass through"**. The tool already did the splitting. Your only job is to forward each chunk verbatim.
-
 For each chunk `i`:
 1. Take `chunks[i].agent_prompt` from the tool response.
-2. Pass that string as the prompt to the **Task** tool. One Task call = one string from the tool. Nothing else.
+2. Pass that string as the prompt to the **Task** tool — verbatim, no edits.
 
 All N Task calls must go into a **single response block** so they execute in parallel.
 
-### Forbidden manipulations between `split_log_chunks` and `Task`
+### What the orchestrator passes vs what sub-agents do
 
-These are the actions the model often "feels like" doing but they BREAK the analysis. Each bullet corresponds to a real failure mode we have observed:
+`chunks[i].agent_prompt` is small (~15–50 KB) — it does NOT contain the raw log. It contains PROJECT_BRIEFING + analysis instructions + a single line:
+```
+Read(filePath="<absolute path>", offset=N, limit=M)
+```
 
-- ❌ **Do NOT save** `chunks[i].agent_prompt` to a file via `Bash`, `Write`, `Edit`, or any other tool. The content does not need to live on disk.
-- ❌ **Do NOT split** `chunks[i].agent_prompt` into segments (40 KB chunks, line ranges, base64 fragments, anything). The tool already produced the only segmentation that matters.
-- ❌ **Do NOT replace** the inline content with "Read this file at offset/limit" instructions to the sub-agent. The content is already embedded — the sub-agent must NOT read anything.
-- ❌ **Do NOT shell out** to Python, PowerShell, Node, Bash one-liners, or any interpreter to "preprocess" the prompt before Task.
-- ❌ **Do NOT shorten, summarize, paraphrase, or excerpt** `agent_prompt`. The tool returned exactly what should go into Task.
-- ❌ **Do NOT substitute placeholders** — there are none left. The tool already substituted `{PROJECT_BRIEFING}` because you passed `projectBriefing` to the tool.
-- ❌ **Do NOT decide** "this string is too large, the sub-agent can't handle it". That is an incorrect assumption — see below.
+Each sub-agent makes **EXACTLY ONE** Read tool call with the supplied offset/limit. That single Read returns the full chunk (because `tool_output` in `opencode.json` has lifted the default truncation cap). Then the sub-agent reasons over the read content and produces the structured report.
 
-### About the size
+### Forbidden manipulations (between split_log_chunks and Task)
 
-If `chunks[i].agent_prompt.length` looks large (200 KB – 1 MB) — that is the **correct** size. The tool sized it under the sub-agent's context window (`contextTokens × 1000 × 0.70` tokens). Just pass it through.
+- ❌ Do NOT save `chunks[i].agent_prompt` to a file, do NOT split it into segments, do NOT shell out to Python/PowerShell/Node.
+- ❌ Do NOT modify the `Read(...)` line in `agent_prompt` (offset/limit are pre-computed by the tool).
+- ❌ Do NOT substitute placeholders — there are none left, the tool inlined `{PROJECT_BRIEFING}` when you called it with `projectBriefing`.
 
-If YOU (the orchestrator) genuinely cannot send the string (e.g. your own context window cannot hold N parallel Task prompts of this size) — that is a signal to **STOP and tell the user**: "Current model cannot fit N × {size} KB of parallel Task prompts. Use a model with a larger context window, or lower `--context`/`--chunks`." Do **NOT** work around it via files/segments/Read — that gives a wrong analysis because sub-agents see truncated data.
+### Sub-agent constraints (also stated inside agent_prompt)
 
-### Sub-agent constraints (informational — described inside `agent_prompt` too)
-
-The sub-agents have **zero tool budget**: no Read, no Grep, no Bash, no Glob, no Task, no split_log_chunks. They reason over the inline embedded chunk and respond with the structured report described inside `agent_prompt`.
+The sub-agents have a **tool budget of exactly ONE Read call**. No Grep, no Bash, no Glob, no Task, no further Read'ы. The single Read with the pre-supplied offset/limit fetches the whole chunk; everything else is pure reasoning over the Read result.
 
 ## Phase 4: Consolidate
 
