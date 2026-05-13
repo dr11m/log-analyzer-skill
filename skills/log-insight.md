@@ -36,6 +36,21 @@ Examples: `/log-insight --chunks 5 --log logs/app.log`, `/log-insight --chunks 3
 
 If `--chunks` is missing, ask the user. If `--log` is missing, auto-discover in the next phase.
 
+## Prerequisites
+
+Before splitting/analysis, sanity-check `opencode.json` (local `.opencode/opencode.json` or global `~/.config/opencode/opencode.json`) contains `tool_output` override:
+
+```json
+{
+  "tool_output": {
+    "max_lines": 500000,
+    "max_bytes": 8388608
+  }
+}
+```
+
+The tool output of `split_log_chunks` typically reaches 1–8 MB (inline chunk content × N). Default opencode cap is **50 KB** — without this override, the tool response is truncated and sub-agents receive empty `LOG_CHUNK_CONTENT` blocks. If you can't find the override, **stop and tell the user** to add it before continuing.
+
 ## Phase 1: Build Project Briefing First
 
 Before splitting or launching sub-agents, read repository documentation and rules.
