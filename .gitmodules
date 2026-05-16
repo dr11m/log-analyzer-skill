@@ -1,0 +1,12 @@
+[submodule "test-projects/Fake-Apache-Log-Generator"]
+	path = test-projects/Fake-Apache-Log-Generator
+	url = https://github.com/kiritbasu/Fake-Apache-Log-Generator.git
+[submodule "test-projects/flog"]
+	path = test-projects/flog
+	url = https://github.com/mingrammer/flog.git
+[submodule "test-projects/loghub"]
+	path = test-projects/loghub
+	url = https://github.com/logpai/loghub.git
+[submodule "test-projects/python-logging-examples"]
+	path = test-projects/python-logging-examples
+	url = https://github.com/amilstead/python-logging-examples.git
