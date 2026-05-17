@@ -25,7 +25,7 @@
   "author": "dr1m",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dr11m/log-analyzer-suite"
+    "url": "https://github.com/dr11m/opencode-log-analyzer"
   },
   "engines": {
     "node": ">=18"
