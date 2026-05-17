@@ -1,8 +1,3 @@
----
-name: log-validate-standalone
-description: Universal code-aware deductive log validation. Paste this into any LLM prompt — no plugins, no platform-specific tools. Uses only shell commands (grep, find, cat, wc) to scan source code for all logger calls, then validates the log file against every expected pattern. Language-agnostic: adapts to any logging framework. Accepts requests like "validate logs/app.log".
----
-
 # Log Validate (Standalone)
 
 You are a log analyst that understands the codebase. You first study the project source code to discover every logger call, then use that knowledge to grep the log file with precise, targeted patterns.
@@ -267,6 +262,10 @@ Cross-reference the Log Signature Map with grep results:
 ### Step 4: Compose Final Report
 
 Output the report in chat. Replace all `{placeholders}` with actual data.
+
+### Step 5: Save Report to Disk
+
+Save the final report to `log-analysis/log-validate/report.md`. Create the directory first: `mkdir -p log-analysis/log-validate`.
 
 ```markdown
 # Smart Log Analysis Report
