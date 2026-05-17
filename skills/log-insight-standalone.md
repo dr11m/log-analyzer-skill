@@ -1,8 +1,3 @@
----
-name: log-insight-standalone
-description: Universal chunked inductive log analysis. No plugin required — uses an inline Node.js script for splitting. Works in any agent platform with Bash + Node.js. Accepts requests like "analyze logs/app.log with 5 chunks" or "/log-insight-standalone --chunks 5 --log logs/app.log".
----
-
 # Log Insight (Standalone)
 
 ## Contract
@@ -61,28 +56,162 @@ Other agent platforms (Claude Code, Cursor, Windsurf/Devin, etc.) typically do n
 
 ## Phase 1: Build Project Briefing First
 
-Before splitting or launching sub-agents, read repository documentation and rules.
+**This is the decisive phase.** Briefing quality determines whether sub-agents can distinguish expected failures (retries, fallbacks, graceful degradation) from real anomalies. A weak briefing → a useless report. Sub-agents see only logs — the briefing must give them a complete model of normal system behavior.
 
-Build one `PROJECT_BRIEFING` for all sub-agents:
+Build one `PROJECT_BRIEFING` for all sub-agents.
 
-- Read `AGENTS.md` and `CLAUDE.md` if present.
-- Read `docs/*.md` if present.
-- Read `README.md` if it contains runtime or business context.
-- Include business rules and workflow rules with high fidelity. If `docs/rules.md`, `docs/business_rules.md`, or equivalent files exist, include their important rule text directly.
-- Summarize architecture, runtime flow, components, expected success path, domain rules, configuration requirements, state transitions, and known invariants.
-- Keep the briefing compact — it must fit alongside one chunk within the ~140K token budget.
+### Step 1: Gather Sources (in priority order)
 
-The briefing must be passed directly in every sub-agent prompt. Sub-agents must not read project docs or source files themselves.
+Read ALL listed files if they exist. Do not skip any.
+
+| Priority | Source | What to extract |
+|----------|--------|-----------------|
+| **P0** | `CLAUDE.md` / `AGENTS.md` | Engineering conventions, architectural contract, module responsibility boundaries |
+| **P0** | `docs/rules.md` | **Business rules and invariants — copy verbatim** |
+| **P0** | `docs/pipeline_flow.md` | **Primary briefing source.** Step-by-step pipeline (bootstrap → loop → stages), every rejection reason with exact names, all numeric thresholds, persistence side effects. If both `workflow.md` and `pipeline_flow.md` exist — prefer `pipeline_flow.md`, extract maximum from it |
+| **P0** | `docs/workflow.md` | Runtime flow: steps, branches, state machine. If `pipeline_flow.md` exists — use as supplement |
+| **P0** | `docs/structure.md` | Module map, components, their roles and relationships |
+| **P1** | `docs/business_rules.md` | Domain rules, validations, constraints |
+| **P1** | `docs/*.md` (all others) | Any descriptions of behavior, configuration, error handling |
+| **P2** | `README.md` | If it contains architectural or business context |
+| **P3** | `config.yaml`, `.env.example`, `*.config.*` | Numeric thresholds: timeouts, limits, intervals, retries, feature flags |
+
+### Step 2: Extract by Category
+
+Process each source, categorizing information strictly as below.
+
+**Core principle:** rules, invariants, and log patterns must be copied **verbatim** — paraphrasing erases precision and makes the briefing useless. Architectural descriptions may be compressed, but all key facts must survive without invention.
+
+#### 2.1 Architecture & Components
+- Full component list: one component = one line with role (e.g. `OrderFetcher — reads orders from Redis queue orders_queue`)
+- For each: what it consumes, what it produces
+- External dependencies with identifiers: databases (`main_db`, `cache`), queues (`orders_queue`, `dlq`), APIs (`payment-api`, `notify-svc`), caches (`redis_sessions`)
+- Call map: who calls whom (A → B → C)
+
+#### 2.2 Runtime Workflow
+- **Happy path** — the full chain from entry point to successful completion. Each step with a verb: `fetch → validate → enrich → persist → notify`
+- **State machine** — all states and transitions. Explicitly list FORBIDDEN transitions (e.g. `[Processed] → [New]` is impossible). Critical: sub-agents must flag any forbidden transition found in logs
+- **Error paths** — all known branches: what happens on validation failure, DB timeout, external API failure
+- **Cycles and schedules** — periodicity of cron jobs, processing loops, batches
+
+#### 2.3 Business Rules & Invariants (MOST IMPORTANT)
+- **Copy verbatim** all rules from `rules.md` / `business_rules.md`. Each rule as a separate entry: `R<n>: <text>`
+- For each rule, specify the format: `CONDITION → ACTION` or `CONDITION → ERROR`
+- Invariants — what must ALWAYS be true. Example: "Every `fetch` must have a matching `ack` or `nack`. A `fetch` without `ack/nack` within 30 seconds = anomaly."
+- Boundary conditions: max/min values, data integrity constraints, uniqueness
+
+#### 2.4 Numeric Thresholds from Configuration
+Collect every number that affects behavior visible in logs. Each on its own line:
+
+| Parameter | Value | What it determines in logs |
+|-----------|-------|---------------------------|
+| `connection_timeout` | 10s | WARNING/ERROR when exceeded |
+| `max_retries` | 3 | After 3 retries → DLQ |
+| `batch_size` | 100 | Batch processing traces |
+
+#### 2.5 Log Pattern Mapping (log message → meaning)
+**The most valuable section for sub-agents.** Collect every log message mention from documentation and build a mapping table:
+
+| Log Pattern (key or fragment) | Level | Meaning | Expected? |
+|------------------------------|-------|---------|-----------|
+| `order.processed` | INFO | Order successfully processed, full cycle complete | Yes |
+| `QueueConsumer.connection_lost` | WARNING | Redis connection lost, normal reconnect | Yes |
+| `dlq.reason=DB_UNAVAILABLE` | ERROR | DB write retries exhausted → message moved to DLQ | No |
+| `ValidationError field=email` | WARNING | Invalid email in input data | Yes |
+
+Sub-agents use this table to instantly determine: is this ERROR line a real problem or expected behavior?
+
+#### 2.6 Expected Anomalies (what is NOT a problem)
+Explicitly collect patterns that look like errors but are normal:
+- **Retry logic**: which errors are retried, how many times, backoff intervals. Example: `ConnectionError → retry up to 3x with backoff 1s/2s/4s`
+- **Graceful degradation**: what happens when an external service fails (no panic, with fallback)
+- **Periodic phenomena**: cold starts, maintenance windows, planned restarts
+
+### Step 3: Assemble the Briefing (template)
+
+Assemble all extracted information into a single text following the structure below exactly. Every section is mandatory. If no data found for a section — write `No data`, but do not omit the section.
+
+```markdown
+PROJECT_BRIEFING
+===============
+
+## 1. System Overview
+<2-3 sentences: what the system does, type (web/api/worker/cron), language/framework>
+
+## 2. Components
+<list: name — role — key dependencies>
+- ComponentA: role, depends on [DB, Redis, ext-API]
+
+## 3. Runtime Workflow
+
+### Happy Path
+<step-by-step successful execution chain: Step1 → Step2 → ... → Result>
+
+### State Machine
+```
+[StateA] --event--> [StateB]
+[StateB] --error--> [StateC]
+```
+Forbidden transitions: [StateX] ↛ [StateY]
+
+### Error Branches
+<what happens for each error type>
+- Error type X → retry N times → when exhausted → DLQ
+
+## 4. Business Rules & Invariants
+<VERBATIM. Each rule as a separate entry.>
+R1: <text>
+R2: <text>
+
+Invariants (must ALWAYS hold):
+- <invariant text>
+- <invariant text>
+
+## 5. Numeric Thresholds
+| Parameter | Value | Log Impact |
+|-----------|-------|-------------|
+| <name> | <N> | <how it appears in logs> |
+
+## 6. Log Pattern → Meaning Map
+| Log Pattern | Level | Meaning | Expected |
+|-------------|-------|---------|----------|
+| <fragment> | ERROR/WARN/INFO | <what it means> | Yes/No |
+
+## 7. Known Non-Issues
+<log patterns that look like errors but are normal>
+- `<pattern>` → normal because <reason>
+```
+
+### Step 4: Quality Check Before Writing
+
+Before writing to `briefing.txt`, run through the checklist. If any item fails — go back to documentation and fill it in:
+
+- [ ] At least one **business rule** (Section 4 is not empty) if the project has `docs/rules.md`
+- [ ] **Happy path** (Section 3) — sub-agents need the reference sequence
+- [ ] At least one **forbidden situation** (forbidden transition or violable invariant)
+- [ ] **Log patterns** with meaning decoded (Section 6): at least 3 if documentation mentions them
+- [ ] **Numeric thresholds** (Section 5): all timeouts, limits, retries from configuration
+- [ ] No filler phrases like "the system processes data" — everything is specific, measurable, verifiable
+- [ ] Briefing fits within ~30% of sub-agent context budget (at `--context 200` that's ~60K tokens; the remaining ~70% is the log chunk)
+
+**If the briefing exceeds budget**, trim in strict order:
+1. Compress component descriptions to 1 line each
+2. Compress workflow descriptions to key transitions only
+3. **NEVER trim** business rules, invariants, or log patterns — these are the foundation of analysis
+
+### Step 5: Write
+
+Write the final `PROJECT_BRIEFING` to `log-analysis/log-insight/briefing.txt` (create the directory first: `mkdir -p log-analysis/log-insight`).
+
+The briefing will be embedded directly in each sub-agent's prompt. **Sub-agents must not read project documentation or source code themselves** — all necessary information is already in the briefing.
 
 ## Phase 2: Split the Log into Chunks
 
-### Step 1: Write the briefing file
+The briefing is already written to `log-analysis/log-insight/briefing.txt` in the previous phase.
 
-Write your PROJECT_BRIEFING text to `.opencode/briefing.txt`. This avoids CLI escaping issues when passing multiline text with quotes to the script.
+### Step 1: Write the split script
 
-### Step 2: Write the split script
-
-Write the following JavaScript to `.opencode/split-log.cjs` (the `.cjs` extension ensures CommonJS compatibility even if the project's `package.json` has `"type": "module"`):
+Write the following JavaScript to `log-analysis/log-insight/split-log.cjs` (the `.cjs` extension ensures CommonJS compatibility even if the project's `package.json` has `"type": "module"`):
 
 ```javascript
 #!/usr/bin/env node
@@ -100,7 +229,7 @@ const logPath = getArg("log");
 const requestedChunks = parseInt(getArg("chunks") || "0", 10);
 const contextTokensK = parseInt(getArg("context") || "200", 10);
 const briefingFile = getArg("briefing-file");
-const chunksDir = getArg("chunks-dir") || ".opencode/chunks";
+const chunksDir = getArg("chunks-dir") || "log-analysis/log-insight/chunks";
 // Note: this script uses CommonJS (require) intentionally.
 // The .cjs extension ensures Node treats it as CommonJS even
 // when the project's package.json has "type": "module".
@@ -168,10 +297,7 @@ if (briefingFile && fs.existsSync(briefingFile)) {
   projectBriefing = fs.readFileSync(briefingFile, "utf8");
 }
 
-// --- Clean up and create chunks dir ---
-if (fs.existsSync(chunksDir)) {
-  fs.rmSync(chunksDir, { recursive: true });
-}
+// --- Ensure chunks dir exists ---
 fs.mkdirSync(chunksDir, { recursive: true });
 
 // --- Agent prompt template (same as plugin) ---
@@ -180,9 +306,10 @@ const PROMPT_TEMPLATE = [
   "Use the user's language for prose in your final answer. Keep log lines, exception names, code identifiers, paths, and technical terms as written.",
   "",
   "Hard tool rules:",
-  '- You may make EXACTLY ONE tool call: Bash(command="cat __CHUNK_FILE__"). That single Bash returns the FULL chunk because the user has tool_output.max_bytes set high enough (>= 8 MB) or their platform does not truncate Bash output.',
-  "- After that one Bash: ZERO further tool calls. Do NOT call Bash again, do NOT call Read/Grep/Glob/Task/Write/any other tool. Do NOT loop, do NOT shell out.",
-  '- If the Bash output has fewer than __LINE_COUNT__ lines, report that exact fact in your output ("Bash returned only N of __LINE_COUNT__ lines — tool_output likely not configured") and analyze whatever you got. Do NOT retry.',
+  '- Step 1: Bash(command="cat __CHUNK_FILE__") — fetch your chunk. Must be your FIRST tool call.',
+  '- Step 2: Bash(command="<shell command to write your report>") — save your COMPLETE analysis to __REPORT_FILE__. Must be your LAST tool call.',
+  "- You may make EXACTLY TWO Bash calls: one cat (read), one save (write). Zero other tool calls of any kind.",
+  '- If the cat output has fewer than __LINE_COUNT__ lines, report that exact fact in your output ("Bash returned only N of __LINE_COUNT__ lines — tool_output likely not configured") and analyze whatever you got. Do NOT retry.',
   "",
   "Purpose:",
   "This is inductive log analysis. You must reason from the complete chunk content, not from filtered matches. Compare observed behavior against the project rules and expected runtime flow.",
@@ -271,9 +398,16 @@ const PROMPT_TEMPLATE = [
   "- Every finding has an exact count.",
   "- Every finding has first AND last timestamps.",
   "- `### Cross-Chunk Signals` is present.",
+  "",
+  "AFTER verification — SAVE YOUR REPORT:",
+  '- Make ONE MORE Bash call to write your ENTIRE analysis (the markdown report you just produced above) to the file __REPORT_FILE__.',
+  "- Use a shell command that writes the full report text. On Unix: printf or a heredoc. On Windows PowerShell: Set-Content or Out-File.",
+  '- Example: Bash(command="printf \'%s\\n\' \'...your full report...\' > __REPORT_FILE__")',
+  "- The orchestrator will verify that __REPORT_FILE__ exists with content. If it doesn't, your analysis is considered incomplete.",
+  "- This is your LAST tool call. After saving, return only a short confirmation: 'Report saved to __REPORT_FILE__'.",
 ].join("\n");
 
-function renderAgentPrompt(chunkNumber, totalChunks, byteSize, lineCount, chunkFile, offset, briefing) {
+function renderAgentPrompt(chunkNumber, totalChunks, byteSize, lineCount, chunkFile, reportFile, offset, briefing) {
   const briefingBlock = briefing.length > 0 ? briefing : "{PROJECT_BRIEFING}";
   const offsetEnd = offset + lineCount - 1;
   return PROMPT_TEMPLATE
@@ -282,6 +416,7 @@ function renderAgentPrompt(chunkNumber, totalChunks, byteSize, lineCount, chunkF
     .replaceAll("__BYTE_SIZE__", String(byteSize))
     .replaceAll("__LINE_COUNT__", String(lineCount))
     .replaceAll("__CHUNK_FILE__", chunkFile.replace(/\\/g, "/"))
+    .replaceAll("__REPORT_FILE__", reportFile.replace(/\\/g, "/"))
     .replaceAll("__OFFSET__", String(offset))
     .replaceAll("__OFFSET_END__", String(offsetEnd))
     .replace("{PROJECT_BRIEFING}", briefingBlock);
@@ -299,7 +434,10 @@ for (let i = 1; i <= requestedChunks; i++) {
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   const byteSize = Buffer.byteLength(chunkText, "utf8");
   const lineCount = chunkLines.length;
-  const chunkFile = path.join(chunksDir, "chunk_" + i + ".log");
+  const chunkDir = path.join(chunksDir, "chunk_" + i);
+  fs.mkdirSync(chunkDir, { recursive: true });
+  const chunkFile = path.join(chunkDir, "tmp_chunk_file");
+  const reportFile = path.join(chunkDir, "report.md");
   fs.writeFileSync(chunkFile, chunkText, "utf8");
   manifestChunks.push({
     number: i,
@@ -308,8 +446,10 @@ for (let i = 1; i <= requestedChunks; i++) {
     byte_size: byteSize,
     line_count: lineCount,
     chunk_file: chunkFile,
+    report_file: reportFile,
+    chunk_dir: chunkDir,
     est_tokens: Math.round(byteSize / BYTES_PER_TOKEN),
-    agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, chunkFile, offset, projectBriefing),
+    agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, chunkFile, reportFile, offset, projectBriefing),
   });
 }
 
@@ -332,12 +472,12 @@ const result = {
 console.log(JSON.stringify(result, null, 2));
 ```
 
-### Step 3: Run the script
+### Step 2: Run the script
 
 Run the script via Bash:
 
 ```
-node .opencode/split-log.cjs --log <absolute-path> --chunks <N> --context <K> --briefing-file .opencode/briefing.txt
+node log-analysis/log-insight/split-log.cjs --log <absolute-path> --chunks <N> --context <K> --briefing-file log-analysis/log-insight/briefing.txt
 ```
 
 - `--log` must be an **absolute path** to the log file.
@@ -347,7 +487,7 @@ node .opencode/split-log.cjs --log <absolute-path> --chunks <N> --context <K> --
 
 The script outputs a JSON manifest to stdout. Parse it.
 
-### Step 4: Surface warnings and summary
+### Step 3: Surface warnings and summary
 
 Print summary to user: N chunks, lines_per_chunk, coverage_percent, max_chunk_tokens.
 
@@ -367,13 +507,14 @@ For each chunk `i`:
 
 ### What the orchestrator passes vs what sub-agents do
 
-`chunks[i].agent_prompt` is compact (~15-50 KB). It contains PROJECT_BRIEFING + analysis instructions + a single Bash directive:
+`chunks[i].agent_prompt` is compact (~15-50 KB). It contains PROJECT_BRIEFING + analysis instructions + two Bash directives:
 
 ```
-Bash(command="cat <chunk_file_path>")
+Bash(command="cat <chunk_file_path>")     # Step 1: fetch chunk
+Bash(command="...")                        # Step 2: save report to __REPORT_FILE__
 ```
 
-Each sub-agent makes **EXACTLY ONE** Bash tool call to `cat` its chunk file. That single Bash returns the full chunk (because `tool_output` in opencode.json has `max_bytes >= 8 MB`, or because the platform does not truncate Bash output). Then the sub-agent reasons over the output and produces the structured report.
+Each sub-agent makes **exactly TWO** Bash calls: one `cat` to fetch the chunk, one to write the report. No other tools. Then the sub-agent returns a short confirmation.
 
 ### Forbidden manipulations (between manifest and sub-agent launch)
 
@@ -383,7 +524,7 @@ Each sub-agent makes **EXACTLY ONE** Bash tool call to `cat` its chunk file. Tha
 
 ### Sub-agent constraints (also stated inside agent_prompt)
 
-The sub-agents have a **tool budget of exactly ONE Bash call**. No Read, no Grep, no Glob, no Task, no further Bash calls. The single `cat` fetches the whole chunk; everything else is pure reasoning over the Bash output.
+The sub-agents have a **tool budget of exactly TWO Bash calls**: one `cat` to fetch the chunk, one to save the report to `__REPORT_FILE__`. No Read, no Grep, no Glob, no Task, no further Bash calls. After the save Bash, the sub-agent returns a short confirmation.
 
 ## Phase 4: Consolidate
 
@@ -409,4 +550,27 @@ Sort findings:
 3. Higher total count first.
 
 End with a **one-paragraph executive summary** covering the most important findings, their root causes, and recommended next steps.
+
+### Phase 4a: Save Final Report to Disk
+
+Write the full consolidated report (the one you just composed in chat) to **`log-analysis/log-insight/report.md`**.
+
+### File Layout After Completion
+
+```
+log-analysis/log-insight/
+├── briefing.txt
+├── split-log.cjs
+├── report.md                     ← final consolidated report
+└── chunks/
+    ├── chunk_1/
+    │   ├── tmp_chunk_file        ← raw chunk data (persist, do NOT delete)
+    │   └── report.md             ← sub-agent's per-chunk analysis
+    ├── chunk_2/
+    │   ├── tmp_chunk_file
+    │   └── report.md
+    └── chunk_N/
+        ├── tmp_chunk_file
+        └── report.md
+```
 

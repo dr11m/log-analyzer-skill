@@ -1,8 +1,3 @@
----
-name: log-insight-standalone
-description: Универсальный индуктивный анализ логов с разбиением на чанки. Плагин не требуется — используется встроенный Node.js-скрипт для разделения. Работает на любой агентной платформе с Bash + Node.js. Принимает запросы вида «analyze logs/app.log with 5 chunks» или «/log-insight-standalone --chunks 5 --log logs/app.log».
----
-
 # Log Insight (Standalone)
 
 ## Контракт
@@ -61,28 +56,162 @@ description: Универсальный индуктивный анализ ло
 
 ## Фаза 1: Сначала собери контекст проекта
 
-Перед разбиением или запуском суб-агентов прочитай документацию и правила репозитория.
+**Это решающий этап.** Качество брифинга определяет, сможет ли суб-агент отличить штатный сбой (retry, fallback, graceful degradation) от настоящей аномалии. Слабый брифинг → бесполезный отчёт. Суб-агент видит только логи — брифинг должен дать ему полную модель нормального поведения системы.
 
-Составь один `PROJECT_BRIEFING` для всех суб-агентов:
+Составь один `PROJECT_BRIEFING` для всех суб-агентов.
 
-- Прочитай `AGENTS.md` и `CLAUDE.md`, если они существуют.
-- Прочитай `docs/*.md`, если они существуют.
-- Прочитай `README.md`, если он содержит контекст рантайма или бизнес-логики.
-- Включи бизнес-правила и правила рабочего процесса с высокой точностью. Если существуют `docs/rules.md`, `docs/business_rules.md` или эквивалентные файлы, включи важный текст правил напрямую.
-- Опиши архитектуру, поток выполнения, компоненты, ожидаемый путь успешного выполнения, доменные правила, требования к конфигурации, переходы состояний и известные инварианты.
-- Брифинг должен быть компактным — он должен помещаться вместе с одним чанком в бюджет ~140K токенов.
+### Шаг 1: Сбор источников (в порядке приоритета)
 
-Брифинг должен передаваться напрямую в каждый промпт суб-агента. Суб-агенты не должны самостоятельно читать документы или исходные файлы проекта.
+Прочитай ВСЕ перечисленные файлы, если они существуют. Не пропускай ни один.
+
+| Приоритет | Источник | Что извлекать |
+|-----------|----------|---------------|
+| **P0** | `CLAUDE.md` / `AGENTS.md` | Инженерные конвенции, архитектурный контракт, границы ответственности модулей |
+| **P0** | `docs/rules.md` | **Бизнес-правила и инварианты — копируй дословно** |
+| **P0** | `docs/pipeline_flow.md` | **Главный источник для брифинга.** Пошаговый pipeline (bootstrap → цикл → этапы), все причины отсева с точными названиями, все числовые пороги, persistence-эффекты. Если есть и `workflow.md`, и `pipeline_flow.md` — `pipeline_flow.md` приоритетнее, бери из него максимум |
+| **P0** | `docs/workflow.md` | Рантайм-поток: шаги, развилки, машина состояний. Если есть `pipeline_flow.md` — используй как дополнение |
+| **P0** | `docs/structure.md` | Карта модулей, компоненты, их роли и связи |
+| **P1** | `docs/business_rules.md` | Доменные правила, валидации, ограничения |
+| **P1** | `docs/*.md` (остальные) | Любые описания поведения, конфигурации, обработки ошибок |
+| **P2** | `README.md` | Если содержит архитектурный или бизнес-контекст |
+| **P3** | `config.yaml`, `.env.example`, `*.config.*` | Числовые пороги: таймауты, лимиты, интервалы, retry, feature-флаги |
+
+### Шаг 2: Извлечение по категориям
+
+Обработай каждый источник, раскладывая информацию строго по категориям ниже.
+
+**Ключевой принцип:** правила, инварианты и лог-паттерны копируй **дословно** — перефразирование стирает точность и делает брифинг бесполезным. Архитектурные описания можно сжимать, но сохраняя все ключевые факты без домысливания.
+
+#### 2.1 Архитектура и компоненты
+- Полный список компонентов: один компонент = одна строка с ролью (например, `OrderFetcher — читает заказы из очереди Redis orders_queue`)
+- Для каждого компонента: что получает на вход, что производит на выходе
+- Внешние зависимости с идентификаторами: БД (`main_db`, `cache`), очереди (`orders_queue`, `dlq`), API (`payment-api`, `notify-svc`), кэши (`redis_sessions`)
+- Карта вызовов: кто кого вызывает (A → B → C)
+
+#### 2.2 Рантайм-поток (workflow)
+- **Happy path** — полная цепочка от точки входа до успешного завершения. Каждый шаг с глаголом: `fetch → validate → enrich → persist → notify`
+- **Машина состояний** — все состояния и переходы. Отдельно перечисли ЗАПРЕЩЁННЫЕ переходы (например, `[Processed] → [New]` невозможен). Это критично: суб-агент должен бить тревогу, увидев запрещённый переход в логах
+- **Error paths** — все известные ответвления: что происходит при ошибке валидации, при таймауте БД, при отказе внешнего API
+- **Циклы и расписания** — с какой периодичностью запускаются cron-задачи, циклы обработки, батчи
+
+#### 2.3 Бизнес-правила и инварианты (КРИТИЧЕСКИ ВАЖНО)
+- **Дословно скопируй** все правила из `rules.md` / `business_rules.md`. Каждое правило — отдельный пункт формата `R<n>: <текст>`
+- Для каждого правила укажи формат: `УСЛОВИЕ → ДЕЙСТВИЕ` или `УСЛОВИЕ → ОШИБКА`
+- Инварианты — что ВСЕГДА должно быть истинно. Пример: "Каждый `fetch` обязан иметь парный `ack` или `nack`. Ситуация `fetch` без `ack/nack` в течение 30 секунд = аномалия."
+- Граничные условия: максимальные/минимальные значения, ограничения целостности данных, уникальность
+
+#### 2.4 Числовые пороги из конфигурации
+Собери все числа, влияющие на поведение, видимое в логах. Каждое — отдельной строкой:
+
+| Параметр | Значение | Что определяет в логах |
+|----------|----------|------------------------|
+| `connection_timeout` | 10s | WARNING/ERROR при превышении |
+| `max_retries` | 3 | После 3-х retry → DLQ |
+| `batch_size` | 100 | Следы батчевой обработки |
+
+#### 2.5 Маппинг лог-паттернов (лог-сообщение → смысл)
+**Это самое ценное для суб-агента.** Собери из документации все упоминания лог-сообщений и составь таблицу соответствий:
+
+| Лог-паттерн (ключ или фрагмент) | Уровень | Смысл | Ожидаемо? |
+|--------------------------------|---------|-------|-----------|
+| `order.processed` | INFO | Заказ успешно обработан, полный цикл завершён | Да |
+| `QueueConsumer.connection_lost` | WARNING | Потеря соединения с Redis, штатный reconnect | Да |
+| `dlq.reason=DB_UNAVAILABLE` | ERROR | Исчерпаны попытки записи в БД → сообщение в DLQ | Нет |
+| `ValidationError field=email` | WARNING | Некорректный email во входных данных | Да |
+
+Суб-агент будет использовать эту таблицу чтобы моментально определить: является ли данная ERROR-строка признаком реальной проблемы или ожидаемым поведением.
+
+#### 2.6 Ожидаемые аномалии (что НЕ является проблемой)
+Собери в явном виде паттерны, которые выглядят как ошибки, но нормальны:
+- **Retry-логика**: какие ошибки retryятся, сколько раз, интервалы backoff. Пример: `ConnectionError → retry до 3 раз с backoff 1s/2s/4s`
+- **Graceful degradation**: что происходит при отказе внешнего сервиса (без паники, с fallback'ом)
+- **Периодические явления**: холодный старт, окна обслуживания, плановые перезапуски
+
+### Шаг 3: Сборка брифинга (шаблон)
+
+Собери извлечённую информацию в единый текст строго по структуре ниже. Каждая секция обязательна. Если источник для секции не найден — напиши `Нет данных`, но не пропускай секцию.
+
+```markdown
+PROJECT_BRIEFING
+===============
+
+## 1. System Overview
+<2-3 предложения: что делает система, тип (web/api/worker/cron), язык/фреймворк>
+
+## 2. Components
+<список: имя — роль — ключевые зависимости>
+- ComponentA: роль, зависит от [DB, Redis, ext-API]
+
+## 3. Runtime Workflow
+
+### Happy Path
+<пошаговая цепочка успешного выполнения: Шаг1 → Шаг2 → ... → Результат>
+
+### State Machine
+```
+[StateA] --событие--> [StateB]
+[StateB] --ошибка-->  [StateC]
+```
+Запрещённые переходы: [StateX] ↛ [StateY]
+
+### Error Branches
+<что происходит при каждом типе ошибки>
+- Ошибка типа X → retry N раз → при исчерпании → DLQ
+
+## 4. Business Rules & Invariants
+<ДОСЛОВНО. Каждое правило — отдельный пункт.>
+R1: <текст>
+R2: <текст>
+
+Invariants (must ALWAYS hold):
+- <текст инварианта>
+- <текст инварианта>
+
+## 5. Numeric Thresholds
+| Parameter | Value | Log Impact |
+|-----------|-------|-------------|
+| <имя> | <N> | <как отражается в логах> |
+
+## 6. Log Pattern → Meaning Map
+| Log Pattern | Level | Meaning | Expected |
+|-------------|-------|---------|----------|
+| <фрагмент> | ERROR/WARN/INFO | <что означает> | Yes/No |
+
+## 7. Known Non-Issues
+<лог-паттерны, похожие на ошибки, но являющиеся нормой>
+- `<pattern>` → нормально, потому что <причина>
+```
+
+### Шаг 4: Проверка качества перед записью
+
+Перед записью в `briefing.txt` пройди чеклист. Если пункт не выполнен — вернись к документации и дополни:
+
+- [ ] Есть хотя бы одно **бизнес-правило** (секция 4 не пуста), если в проекте найден `docs/rules.md`
+- [ ] Есть **happy path** (секция 3) — суб-агент должен знать эталонную последовательность
+- [ ] Есть хотя бы одна **запрещённая ситуация** (запрещённый переход или нарушаемый инвариант)
+- [ ] **Лог-паттерны** с расшифровкой значения (секция 6): минимум 3, если документация их упоминает
+- [ ] **Числовые пороги** (секция 5): все таймауты, лимиты, retry из конфигурации
+- [ ] В брифинге нет фраз-пустышек вроде "система обрабатывает данные" — всё конкретно, измеримо, проверяемо
+- [ ] Брифинг помещается в ~30% бюджета контекста суб-агента (при `--context 200` это ~60K токенов; остальные ~70% — чанк лога)
+
+**Если брифинг превышает бюджет**, сокращай строго в порядке:
+1. Сжать описания компонентов до 1 строки
+2. Сжать workflow-описания до ключевых переходов
+3. **НИКОГДА не сокращай** бизнес-правила, инварианты и лог-паттерны — это основа анализа
+
+### Шаг 5: Запись
+
+Запиши итоговый `PROJECT_BRIEFING` в `log-analysis/log-insight/briefing.txt` (создай директорию: `mkdir -p log-analysis/log-insight`).
+
+Брифинг будет встроен напрямую в промпт каждого суб-агента. **Суб-агенты не должны самостоятельно читать документацию или исходный код проекта** — вся необходимая информация уже в брифинге.
 
 ## Фаза 2: Разбей лог на чанки
 
-### Шаг 1: Запиши файл брифинга
+Брифинг уже записан в `log-analysis/log-insight/briefing.txt` на предыдущей фазе.
 
-Запиши текст PROJECT_BRIEFING в `.opencode/briefing.txt`. Это позволяет избежать проблем с экранированием в CLI при передаче многострочного текста с кавычками в скрипт.
+### Шаг 1: Запиши скрипт разбиения
 
-### Шаг 2: Запиши скрипт разбиения
-
-Запиши следующий JavaScript в `.opencode/split-log.cjs` (расширение `.cjs` гарантирует совместимость с CommonJS, даже если `package.json` проекта содержит `"type": "module"`):
+Запиши следующий JavaScript в `log-analysis/log-insight/split-log.cjs` (расширение `.cjs` гарантирует совместимость с CommonJS, даже если `package.json` проекта содержит `"type": "module"`):
 
 ```javascript
 #!/usr/bin/env node
@@ -100,7 +229,7 @@ const logPath = getArg("log");
 const requestedChunks = parseInt(getArg("chunks") || "0", 10);
 const contextTokensK = parseInt(getArg("context") || "200", 10);
 const briefingFile = getArg("briefing-file");
-const chunksDir = getArg("chunks-dir") || ".opencode/chunks";
+const chunksDir = getArg("chunks-dir") || "log-analysis/log-insight/chunks";
 // Примечание: этот скрипт намеренно использует CommonJS (require).
 // Расширение .cjs гарантирует, что Node обработает его как CommonJS,
 // даже когда package.json проекта имеет "type": "module".
@@ -168,10 +297,7 @@ if (briefingFile && fs.existsSync(briefingFile)) {
   projectBriefing = fs.readFileSync(briefingFile, "utf8");
 }
 
-// --- Очистка и создание директории чанков ---
-if (fs.existsSync(chunksDir)) {
-  fs.rmSync(chunksDir, { recursive: true });
-}
+// --- Создание директории чанков ---
 fs.mkdirSync(chunksDir, { recursive: true });
 
 // --- Шаблон промпта агента (аналогично плагину) ---
@@ -180,9 +306,10 @@ const PROMPT_TEMPLATE = [
   "Use the user's language for prose in your final answer. Keep log lines, exception names, code identifiers, paths, and technical terms as written.",
   "",
   "Hard tool rules:",
-  '- You may make EXACTLY ONE tool call: Bash(command="cat __CHUNK_FILE__"). That single Bash returns the FULL chunk because the user has tool_output.max_bytes set high enough (>= 8 MB) or their platform does not truncate Bash output.',
-  "- After that one Bash: ZERO further tool calls. Do NOT call Bash again, do NOT call Read/Grep/Glob/Task/Write/any other tool. Do NOT loop, do NOT shell out.",
-  '- If the Bash output has fewer than __LINE_COUNT__ lines, report that exact fact in your output ("Bash returned only N of __LINE_COUNT__ lines — tool_output likely not configured") and analyze whatever you got. Do NOT retry.',
+  '- Step 1: Bash(command="cat __CHUNK_FILE__") — fetch your chunk. Must be your FIRST tool call.',
+  '- Step 2: Bash(command="<shell command to write your report>") — save your COMPLETE analysis to __REPORT_FILE__. Must be your LAST tool call.',
+  "- You may make EXACTLY TWO Bash calls: one cat (read), one save (write). Zero other tool calls of any kind.",
+  '- If the cat output has fewer than __LINE_COUNT__ lines, report that exact fact in your output ("Bash returned only N of __LINE_COUNT__ lines — tool_output likely not configured") and analyze whatever you got. Do NOT retry.',
   "",
   "Purpose:",
   "This is inductive log analysis. You must reason from the complete chunk content, not from filtered matches. Compare observed behavior against the project rules and expected runtime flow.",
@@ -271,9 +398,16 @@ const PROMPT_TEMPLATE = [
   "- Every finding has an exact count.",
   "- Every finding has first AND last timestamps.",
   "- `### Cross-Chunk Signals` is present.",
+  "",
+  "AFTER verification — SAVE YOUR REPORT:",
+  '- Make ONE MORE Bash call to write your ENTIRE analysis (the markdown report you just produced above) to the file __REPORT_FILE__.',
+  "- Use a shell command that writes the full report text. On Unix: printf or a heredoc. On Windows PowerShell: Set-Content or Out-File.",
+  '- Example: Bash(command="printf \'%s\\n\' \'...your full report...\' > __REPORT_FILE__")',
+  "- The orchestrator will verify that __REPORT_FILE__ exists with content. If it doesn't, your analysis is considered incomplete.",
+  "- This is your LAST tool call. After saving, return only a short confirmation: 'Report saved to __REPORT_FILE__'.",
 ].join("\n");
 
-function renderAgentPrompt(chunkNumber, totalChunks, byteSize, lineCount, chunkFile, offset, briefing) {
+function renderAgentPrompt(chunkNumber, totalChunks, byteSize, lineCount, chunkFile, reportFile, offset, briefing) {
   const briefingBlock = briefing.length > 0 ? briefing : "{PROJECT_BRIEFING}";
   const offsetEnd = offset + lineCount - 1;
   return PROMPT_TEMPLATE
@@ -282,6 +416,7 @@ function renderAgentPrompt(chunkNumber, totalChunks, byteSize, lineCount, chunkF
     .replaceAll("__BYTE_SIZE__", String(byteSize))
     .replaceAll("__LINE_COUNT__", String(lineCount))
     .replaceAll("__CHUNK_FILE__", chunkFile.replace(/\\/g, "/"))
+    .replaceAll("__REPORT_FILE__", reportFile.replace(/\\/g, "/"))
     .replaceAll("__OFFSET__", String(offset))
     .replaceAll("__OFFSET_END__", String(offsetEnd))
     .replace("{PROJECT_BRIEFING}", briefingBlock);
@@ -299,7 +434,10 @@ for (let i = 1; i <= requestedChunks; i++) {
     .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
   const byteSize = Buffer.byteLength(chunkText, "utf8");
   const lineCount = chunkLines.length;
-  const chunkFile = path.join(chunksDir, "chunk_" + i + ".log");
+  const chunkDir = path.join(chunksDir, "chunk_" + i);
+  fs.mkdirSync(chunkDir, { recursive: true });
+  const chunkFile = path.join(chunkDir, "tmp_chunk_file");
+  const reportFile = path.join(chunkDir, "report.md");
   fs.writeFileSync(chunkFile, chunkText, "utf8");
   manifestChunks.push({
     number: i,
@@ -308,8 +446,10 @@ for (let i = 1; i <= requestedChunks; i++) {
     byte_size: byteSize,
     line_count: lineCount,
     chunk_file: chunkFile,
+    report_file: reportFile,
+    chunk_dir: chunkDir,
     est_tokens: Math.round(byteSize / BYTES_PER_TOKEN),
-    agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, chunkFile, offset, projectBriefing),
+    agent_prompt: renderAgentPrompt(i, requestedChunks, byteSize, lineCount, chunkFile, reportFile, offset, projectBriefing),
   });
 }
 
@@ -332,12 +472,12 @@ const result = {
 console.log(JSON.stringify(result, null, 2));
 ```
 
-### Шаг 3: Запусти скрипт
+### Шаг 2: Запусти скрипт
 
 Запусти скрипт через Bash:
 
 ```
-node .opencode/split-log.cjs --log <абсолютный-путь> --chunks <N> --context <K> --briefing-file .opencode/briefing.txt
+node log-analysis/log-insight/split-log.cjs --log <абсолютный-путь> --chunks <N> --context <K> --briefing-file log-analysis/log-insight/briefing.txt
 ```
 
 - `--log` должен быть **абсолютным путём** к файлу лога.
@@ -347,7 +487,7 @@ node .opencode/split-log.cjs --log <абсолютный-путь> --chunks <N> 
 
 Скрипт выводит JSON-манифест в stdout. Разбери его.
 
-### Шаг 4: Покажи предупреждения и сводку
+### Шаг 3: Покажи предупреждения и сводку
 
 Выведи пользователю сводку: N чанков, lines_per_chunk, coverage_percent, max_chunk_tokens.
 
@@ -367,13 +507,14 @@ JSON-манифест содержит массив `chunks[]`. Каждый э�
 
 ### Что передаёт оркестратор vs что делают суб-агенты
 
-`chunks[i].agent_prompt` компактен (~15-50 КБ). Он содержит PROJECT_BRIEFING + инструкции анализа + одну директиву Bash:
+`chunks[i].agent_prompt` компактен (~15-50 КБ). Он содержит PROJECT_BRIEFING + инструкции анализа + две директивы Bash:
 
 ```
-Bash(command="cat <путь_к_файлу_чанка>")
+Bash(command="cat <путь_к_файлу_чанка>")     # Шаг 1: получить чанк
+Bash(command="...")                           # Шаг 2: сохранить отчёт в __REPORT_FILE__
 ```
 
-Каждый суб-агент делает **РОВНО ОДИН** вызов Bash для `cat` своего файла чанка. Этот единственный Bash возвращает полный чанк (потому что `tool_output` в opencode.json имеет `max_bytes >= 8 МБ`, или потому что платформа не обрезает вывод Bash). Затем суб-агент рассуждает над выводом и формирует структурированный отчёт.
+Каждый суб-агент делает **ровно ДВА** вызова Bash: один `cat` для получения чанка, один для записи отчёта. Никаких других инструментов. После сохранения суб-агент возвращает короткое подтверждение.
 
 ### Запрещённые манипуляции (между манифестом и запуском суб-агента)
 
@@ -383,7 +524,7 @@ Bash(command="cat <путь_к_файлу_чанка>")
 
 ### Ограничения суб-агентов (также указаны внутри agent_prompt)
 
-У суб-агентов **бюджет инструментов — ровно ОДИН вызов Bash**. Никаких Read, Grep, Glob, Task, никаких дополнительных вызовов Bash. Единственный `cat` получает весь чанк; всё остальное — чистое рассуждение над выводом Bash.
+У суб-агентов **бюджет инструментов — ровно ДВА вызова Bash**: один `cat` для получения чанка, один для сохранения отчёта в `__REPORT_FILE__`. Никаких Read, Grep, Glob, Task, никаких дополнительных вызовов Bash. После сохранения суб-агент возвращает короткое подтверждение.
 
 ## Фаза 4: Консолидация
 
@@ -409,3 +550,26 @@ Bash(command="cat <путь_к_файлу_чанка>")
 3. Большее общее количество — выше.
 
 Заверши **одним абзацем с резюме руководства**, охватывающим наиболее важные находки, их корневые причины и рекомендуемые следующие шаги.
+
+### Фаза 4a: Сохранение финального отчёта
+
+Запиши полный консолидированный отчёт (тот, который ты только что составил в чате) в **`log-analysis/log-insight/report.md`**.
+
+### Структура файлов после завершения
+
+```
+log-analysis/log-insight/
+├── briefing.txt
+├── split-log.cjs
+├── report.md                     ← финальный консолидированный отчёт
+└── chunks/
+    ├── chunk_1/
+    │   ├── tmp_chunk_file        ← сырые данные чанка (НЕ удалять)
+    │   └── report.md             ← анализ чанка от суб-агента
+    ├── chunk_2/
+    │   ├── tmp_chunk_file
+    │   └── report.md
+    └── chunk_N/
+        ├── tmp_chunk_file
+        └── report.md
+```

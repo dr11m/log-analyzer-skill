@@ -1,143 +1,126 @@
-# Log Analyzer Suite — OpenCode Plugin
+# Log Analyzer Suite
 
-Плагин для [OpenCode](https://opencode.ai), добавляющий два метода AI-анализа логов: индуктивный (log-insight) и дедуктивный (log-validate).
+Набор инструментов для автоматического анализа логов — индуктивного (по чанкам) и дедуктивного (по сигнатурам кода).
 
-## Установка
+## Форматы
 
-### Для конкретного проекта (рекомендуется)
+Проект поставляется в двух форматах — для разных сред использования:
 
-В корне проекта выполни:
+### Standalone (`skills/*.md`)
+Промпты-инструкции, которые можно скопировать и вставить в **любую** LLM-среду (ChatGPT, Claude, Cursor, Windsurf, opencode, и т.д.). Каждый файл — самодостаточный: содержит всю логику и встроенные скрипты (JS или shell), не требует плагинов.
 
-```powershell
-opencode plugin @dr39m/log-analyzer-suite@latest
+| Файл | Назначение |
+|------|-----------|
+| `skills/log-insight-standalone.md` | Индуктивный анализ с контекстом проекта (EN) |
+| `skills/log-insight-standalone_ru.md` | То же, на русском |
+| `skills/log-validate-standalone.md` | Дедуктивная валидация по коду (EN) |
+| `skills/log-validate-standalone_ru.md` | То же, на русском |
+| `skills/log-insight-lite_ru.md` | Индуктивный анализ **без** контекста проекта (только лог) |
+
+### Plugin для opencode (`.opencode/skills/`)
+Готовые скилы для агента **opencode** с нативными инструментами (`split_log_chunks`, Grep/Glob/Read). Не требуют JS/Node.js — вся логика на инструментах платформы.
+
+| Папка | Назначение |
+|-------|-----------|
+| `.opencode/skills/log-insight/SKILL.md` | Индуктивный анализ через нативный `split_log_chunks` |
+| `.opencode/skills/log-validate/SKILL.md` | Дедуктивная валидация через Grep/Glob/Read |
+
+## Виды анализа
+
+### 1. Log Insight (индуктивный, по чанкам)
+
+Разбивает лог-файл на N равных чанков (с конца файла — свежие данные первыми). Каждый чанк анализирует отдельный саб-агент, затем оркестратор собирает консолидированный отчёт с трендами по всем чанкам.
+
+- **Требует:** Node.js (для скрипта разбиения в standalone-версии)
+- **Контекст проекта:** читает `AGENTS.md`, `CLAUDE.md`, `docs/*.md` и передаёт брифинг каждому саб-агенту
+- **Результат:** `log-analysis/log-insight/report.md` + отчёты по каждому чанку
+
+### 2. Log Validate (дедуктивный, по сигнатурам)
+
+Сканирует исходный код проекта, находит **все** вызовы логгера (logger.error, console.warn, и т.д.), строит карту сигнатур, а затем grep'ает лог-файл каждым паттерном. Обнаруживает ошибки, аномалии и "молчащие" компоненты.
+
+- **Требует:** только shell (bash/zsh/Git Bash) — grep, find, cat, wc
+- **Контекст проекта:** читает весь исходный код, документацию, правила
+- **Результат:** `log-analysis/log-validate/report.md`
+
+### 3. Log Insight Lite (индуктивный, без проекта)
+
+То же, что Log Insight, но **без контекста проекта**. Только лог-файл. Саб-агенты сами выводят формат лога, тип приложения, компоненты и ожидаемое поведение — исключительно из содержимого лога.
+
+- **Применение:** чужие логи, неизвестные системы, быстрый анализ без изучения кодовой базы
+- **Контекст проекта:** не требуется
+- **Результат:** отчёт в чате (без сохранения на диск в текущей версии)
+
+## Сравнение
+
+| | Insight Standalone | Insight Lite | Validate Standalone |
+|---|---|---|---|
+| **Метод** | Индуктивный | Индуктивный | Дедуктивный |
+| **Разбиение на чанки** | Да (JS-скрипт) | Да (JS-скрипт) | Нет |
+| **Контекст проекта** | Да (документация) | Нет | Да (исходный код) |
+| **Саб-агенты** | N параллельных | N параллельных | Нет |
+| **Зависимости** | Node.js | Node.js | Только shell |
+| **Сохранение на диск** | Да | Нет | Да |
+
+## Структура вывода (Insight)
+
 ```
-
-Это добавит плагин в `.opencode/opencode.json` и подтянет его из npm.
-
-### Глобально (для всех проектов)
-
-```powershell
-opencode plugin @dr39m/log-analyzer-suite@latest --global
+log-analysis/
+├── log-insight/
+│   ├── briefing.txt              # брифинг проекта
+│   ├── split-log.cjs            # скрипт разбиения
+│   ├── report.md                # финальный сводный отчёт
+│   └── chunks/
+│       ├── chunk_1/
+│       │   ├── tmp_chunk_file   # сырые данные чанка
+│       │   └── report.md        # отчёт саб-агента
+│       └── ...
+└── log-validate/
+    └── report.md                # финальный отчёт валидации
 ```
-
-### Что происходит при первом запуске
-
-Плагин автоматически:
-- Создаст файлы навыков (`SKILL.md`) в `.opencode/skills/`
-- Зарегистрирует слэш-команды `/log-insight` и `/log-validate`
-- Добавит тул `split_log_chunks` для расчёта границ чанков
-
-Никаких дополнительных действий не требуется.
-
-### ⚠️ ОБЯЗАТЕЛЬНО: `tool_output` в `opencode.json`
-
-Плагин возвращает большой JSON (3 чанка × ~600 KB ≈ **1.7 MB**), а у opencode дефолтный cap tool output — всего **50 KB**. Без настройки твой `split_log_chunks` ответ обрежется и сабагенты получат пустые `LOG_CHUNK_CONTENT` секции.
-
-Добавь в `.opencode/opencode.json` проекта (или глобально в `~/.config/opencode/opencode.json`):
-
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "plugin": ["@dr39m/log-analyzer-suite@latest"],
-  "tool_output": {
-    "max_lines": 500000,
-    "max_bytes": 8388608
-  }
-}
-```
-
-- `max_bytes: 8388608` (8 MB) — этого хватит на ~10 чанков с большим `--context`.
-- `max_lines: 500000` — щедрый запас.
-
-**Эта опция недокументирована на opencode.ai/docs**, но реализована в коде opencode и проверена на версии 1.14.48. Подробности — в `docs/opencode-output-limits.md`.
-
-### Требования к модели
-
-`/log-insight` инлайнит весь чанк в Task-промпт сабагента (~`contextTokens × 1000 × 0.70` токенов). Для `--context 250 / 3 chunks` каждый сабагент получает промпт ~240K токенов — это требует модель с большим контекстом (1M токенов: **Opus 4.7 / Sonnet 4.5+**). Если модель меньше — понижай `--context` (например `--context 100`) и увеличивай `--chunks`.
-
-Принцип работы: **«поделили — передали»**. Тул нарезает чанки и сразу отдаёт готовые промпты с inline-контентом — оркестратор передаёт их в Task **дословно**, сабагент получает контент в первом сообщении без всяких tool calls. Полный чёрный список запрещённых действий оркестратора — в Phase 3 скилла.
-
-## Обновление
-
-```powershell
-opencode plugin @dr39m/log-analyzer-suite@latest --force
-```
-
-**Важно про суффикс `@latest`.** Без него `--force` подтягивает не свежую версию с npm, а перетягивает ту, что уже зафиксирована во внутреннем lock-файле opencode'а. Суффикс `@latest` явно говорит opencode'у пересчитать тег и взять актуальную версию из npm.
-
-Навыки в `.opencode/skills/<name>/SKILL.md` обновляются автоматически: начиная с 1.0.6 плагин пишет рядом со скиллом файл `.bundle-version` и при каждом запуске сравнивает с встроенной версией. При расхождении SKILL.md перезаписывается.
 
 ## Использование
 
-### `/log-insight` — индуктивный анализ
+### Standalone (любая LLM-среда)
 
-Разбивает лог на N чанков, анализирует каждый параллельным субагентом, собирает тренды.
+1. Скопируй содержимое нужного `.md` файла
+2. Вставь в чат с LLM
+3. Укажи путь к логу и параметры (для Insight: `--chunks N`, для Validate: просто путь)
 
+Примеры:
+```
+/log-insight-standalone --chunks 5 --log logs/app.log
+/log-insight-standalone --chunks 3 --context 700 --log logs/app.log
+/validate logs/app.log
+```
+
+### Plugin (opencode)
+
+Скилы загружаются автоматически. Используй как слэш-команды:
 ```
 /log-insight --chunks 5 --log logs/app.log
-/log-insight --chunks 5 --log logs/app.log --context 700
-/log-insight --chunks 3
-```
-
-**Флаги:**
-- `--chunks N` — количество чанков (обязательно).
-- `--log <path>` — путь к лог-файлу (опционально; автоопределение в `logs/`).
-- `--context K` — окно контекста саб-агента в **тысячах токенов** (опционально, дефолт `200`). Каждый чанк ограничивается 70% от этого окна.
-
-**Как работает:**
-1. Оркестратор читает документацию проекта → `PROJECT_BRIEFING`.
-2. Тул `split_log_chunks` нарезает файл на N равных чанков с конца и возвращает для каждого чанка **готовый промпт сабагента** в `chunks[i].agent_prompt` — с уже встроенным текстом чанка и единственным placeholder `{PROJECT_BRIEFING}`.
-3. Оркестратор делает одну подстановку `{PROJECT_BRIEFING}` и передаёт строку целиком в Task tool. N сабагентов запускаются параллельно одним сообщением и не используют Read/Grep/Bash.
-4. Консолидация находок с трендами (worsening/improving/stable/spike).
-
-### `/log-validate` — дедуктивная валидация
-
-Сканирует исходный код, строит карту всех logger-вызовов, проверяет лог на соответствие.
-
-```
 /log-validate logs/app.log
-/log-validate
 ```
 
-**Как работает:**
-1. Читает документацию проекта
-2. Определяет logging-фреймворк проекта (loguru, stdlib, console.log, log, zap, etc.)
-3. Grep'ает исходники → строит Log Signature Map (все `logger.error/info/...`)
-4. Группирует grep-паттерны по 5 категориям (Errors, Warnings, State/Flow, Metrics, Health)
-5. Батчево грепает лог: COUNT → TRIAGE → EXTRACT
-6. Находит ошибки, аномалии, «тихие» компоненты
+## **Требования**
 
-**Не зависит от языка проекта.** Скилл сам определяет logging-конвенции (Python, JS/TS, Go, Rust и т.д.).
+- **Node.js** — для standalone-версий Insight (скрипт разбиения `split-log.cjs`)
+- **Shell (bash/zsh/Git Bash/MSYS2/WSL)** — для Validate
+- **opencode** — только для plugin-версий в `.opencode/skills/`
 
-## Кастомный тул
+---
 
-| Тул | Назначение |
-|-----|-----------|
-| `split_log_chunks` | Нарезает лог на N равных чанков с конца файла. Каждый чанк ограничивается 70% от `--context` (тысячи токенов). Возвращает метаданные **и готовый Task-промпт сабагента** в `chunks[i].agent_prompt` (с уже встроенным контентом и одним placeholder `{PROJECT_BRIEFING}`), плюс `warnings[]` при неполном покрытии. |
+## English
 
-**Всё остальное делается встроенными тулами opencode** (Read, Grep, Bash, Agent, Glob) — навыки инструктируют AI как их применять.
+A suite of tools for automated log analysis — inductive (chunked) and deductive (signature-based).
 
-## Отличия навыков
+### Formats
 
-| | log-insight | log-validate |
-|---|---|---|
-| Подход | Индуктивный (от данных к выводам) | Дедуктивный (от кода к логу) |
-| Покрытие | N чанков (контролируемое) | 100% файла (через grep) |
-| Контекст | Документация проекта | Исходный код + документация |
-| Находит | Ошибки, аномалии, тренды | Ошибки, нарушения, тихие компоненты |
-| Зависимость от языка | Нет (читает сырой текст) | Адаптируется под язык проекта |
-| Кастомные тулы | `split_log_chunks` | — (только встроенные) |
+- **Standalone** (`skills/*.md`) — copy-paste prompts for any LLM environment. Self-contained: all logic and scripts inlined.
+- **Plugin** (`.opencode/skills/`) — ready-to-use opencode skills with native tooling (`split_log_chunks`, Grep/Glob/Read).
 
-## Публикация (для разработчика)
+### Analysis Types
 
-```bash
-cd opencode-log-analyzer
-npm login                    # один раз
-npm publish --access public  # публикация в npm
-```
-
-После публикации любой пользователь сможет установить плагин через `opencode.json`.
-
-## Лицензия
-
-MIT
+- **Log Insight** — chunked inductive analysis with project context. Splits logs, launches N parallel sub-agents, merges findings into a trend report.
+- **Log Validate** — code-aware deductive validation. Scans all logger calls in source, greps the log for every expected pattern.
+- **Log Insight Lite** — same as Insight but without project context. Infers everything from log content alone. Good for unknown systems.
