@@ -102,6 +102,19 @@ log-analysis/
 /log-validate logs/app.log
 ```
 
+## Пример разбора
+
+Реальный прогон на логе из публичного issue [OctoPrint](https://github.com/OctoPrint/OctoPrint) — [#5048: Filament run out does not allow resuming anymore](https://github.com/OctoPrint/OctoPrint/issues/5048).
+
+| | |
+|---|---|
+| **Проект** | [OctoPrint](https://github.com/OctoPrint/OctoPrint) 1.10.2 — веб-интерфейс для 3D-принтеров |
+| **Ошибка в issue** | после срабатывания датчика филамента кнопка Resume пропадает из UI, печать остаётся на паузе |
+| **Лог** | `octoprint.log` из systeminfo-бандла issue (~5.2 MB, 37 836 строк, 6 дней, Raspberry Pi 4, 46 плагинов) |
+| **Полный разбор** | [Log Insight](docs/example_analysis/log-insight/report.md) · [Log Validate](docs/example_analysis/log-validate/report.md) |
+
+Оба метода независимо показали, что **~69% лога** — шум плагина OctoEverywhere (snapshot-цикл ~1 с). Insight связал это с эскалацией `RuntimeError: can't start new thread` (46+) и `MemoryError`, плюс нестабильный USB/serial. Validate по 829 вызовам логгера в коде подтвердил те же кластеры (сеть, serial, Telegram, softwareupdate).
+
 ## **Требования**
 
 - **Node.js** — для standalone-версий Insight (скрипт разбиения `split-log.cjs`)
@@ -124,3 +137,7 @@ A suite of tools for automated log analysis — inductive (chunked) and deductiv
 - **Log Insight** — chunked inductive analysis with project context. Splits logs, launches N parallel sub-agents, merges findings into a trend report.
 - **Log Validate** — code-aware deductive validation. Scans all logger calls in source, greps the log for every expected pattern.
 - **Log Insight Lite** — same as Insight but without project context. Infers everything from log content alone. Good for unknown systems.
+
+### Real-world example
+
+[OctoPrint](https://github.com/OctoPrint/OctoPrint) 1.10.2 log from [#5048](https://github.com/OctoPrint/OctoPrint/issues/5048) (filament run-out, Resume button missing). Full reports: [Insight](docs/example_analysis/log-insight/report.md), [Validate](docs/example_analysis/log-validate/report.md). Both tools flagged OctoEverywhere as ~69% of the log and tied it to thread/memory exhaustion plus serial USB failures.

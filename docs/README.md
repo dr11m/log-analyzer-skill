@@ -3,6 +3,7 @@
 ## Рабочие результаты
 
 - [results.md](results.md) — что реально сработало, конфигурация, поток данных, ключевые находки
+- [example_analysis/](example_analysis/) — разбор лога [OctoPrint](https://github.com/OctoPrint/OctoPrint) из issue [#5048](https://github.com/OctoPrint/OctoPrint/issues/5048): [Insight](example_analysis/log-insight/report.md), [Validate](example_analysis/log-validate/report.md)
 
 ## Исследовательские материалы
 

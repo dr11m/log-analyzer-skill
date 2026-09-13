@@ -1,0 +1,141 @@
+PROJECT_BRIEFING
+===============
+
+## 1. System Overview
+OctoPrint 1.10.2 — web-based control interface for consumer 3D printers. Python/Flask application running on Raspberry Pi 4 (1.8GHz, 8GB RAM) under OctoPi 1.0.0 (32-bit Linux, Python 3.9.2). Connects to a CoreXY printer running Marlin 2.1.2.2 firmware at 115200 baud via serial/USB. Provides REST API, WebSocket/SockJS real-time updates, plugin system (46 plugins active).
+
+## 2. Components
+- **octoprint.server (Flask)**: Web server, REST API, SockJS WebSocket, preemptive cache. Dependencies: Flask, Tornado, SockJS
+- **octoprint.util.comm (Serial comm)**: Serial communication with printer, GCODE queue, monitoring state machine. Dependencies: pyserial
+- **octoprint.printer.standard**: Printer interface, job management, state transitions. Depends on comm layer
+- **octoprint.settings**: Global settings with YAML config, migration overlays, deprecated path compatibility
+- **octoprint.plugin.core**: Plugin loader (46 plugins: bundled + third-party). Mixin & hook system
+- **octoprint.access.users**: User authentication, session management (Flask-Login)
+- **octoprint.server.util.flask**: Flask utilities: login, caching, CSRF protection
+- **octoprint.server.util.sockjs**: WebSocket/SockJS real-time client connections
+- **octoprint.filemanager.storage**: File management for uploaded GCODE files, metadata analysis
+- **octoprint.util.connectivity.connectivity_checker**: Network connectivity monitoring (DNS resolution, TCP to 1.1.1.1:53)
+- **octoprint.server.heartbeat**: Periodic heartbeat logging (900s interval)
+- **octoprint.events**: Event system, first event triggers startup processing
+- **octoprint.plugins.tracking**: Anonymous usage tracking (version, plugins, uptime, printer state)
+- **Third-party plugins of note**:
+  - OctoEverywhere (3.4.5): Remote access via wss://*.octoeverywhere.com, includes webcam, first-layer, notification timers
+  - ZupFe (0.1.3): PSU control, web UI errors
+  - Sticky Pad (0.1.4): Notes/annotations plugin, settings corruption
+  - Dashboard (1.19.11), Telegram (1.6.7), Filament Manager, BLTouch, Exclude Region, PrintTimeGenius, Marlin EEPROM Editor, Firmware Updater, Arc-Welder, multi-cam
+
+## 3. Runtime Workflow
+
+### Happy Path
+1. System startup → autoconnect to printer → serial detection → connect
+2. Firmware capability report → configure timeouts, autoreport features
+3. Ready (OPERATIONAL) → user selects GCODE file → print started
+4. Monitoring state: Offline → Detecting serial connection → Operational → Starting → Printing → Finishing → Operational
+5. Print completes → metadata update → event notifications → webcam final snapshot
+
+### State Machine
+```
+[Offline] --autoconnect--> [Detecting serial connection]
+[Detecting serial connection] --connected--> [Operational]
+[Operational] --print selected--> [Starting]
+[Starting] --M110/start--> [Printing]
+[Printing] --job done--> [Finishing]
+[Finishing] --cleanup--> [Operational]
+[Printing] --cancel--> [Cancelling]
+[Cancelling] --timeout/reset--> [Operational]
+[Operational] --disconnect--> [Offline]
+[Any] --error/disconnect--> [Offline]
+```
+
+### Error Branches
+- Serial communication timeout → retry up to maxCommunicationTimeouts (idle: 2, printing: 5) → disconnect on exhaustion
+- Serial read error → logged as ERROR with traceback → disconnection on disconnectOnErrors (default: true)
+- MemoryError during JSON serialization of files API → Flask returns 500, client sees error
+- Plugin blueprint CSRF disabled → security downgrade warning at startup
+- Connectivity checker offline → DNS/TCP failures logged, plugin blacklist not fetched
+- Tracking event send failure → silently fails (fire-and-forget)
+- Webcam snapshot detection → MultiCam default without snapshot support → OctoEverywhere self-detects URL
+- Sticky Pad settings corruption (non-dict at note/ops path) → ignored with WARNING per path occurrence
+
+## 4. Business Rules & Invariants
+
+R1: Serial communication timeout defaults: communication = 30s, communicationBusy = 3s (when busy protocol detected)
+R2: Max communication timeouts: idle = 2, printing = 5, long = 5
+R3: Server heartbeat logs every 900s (15 min)
+R4: Connectivity checker tests 1.1.1.1:53 and octoprint.org resolution; failures logged as "offline"
+R5: Tracking events sent for: ping (uptime+state, every ~15 min), webui_load, printer_connected, print_started, pong (full system info at first ping after connect), startup
+R6: Busy protocol detection shortens communication timeout from 30s to 3s
+R7: Preemptive cache renders UI for base_url variations (https://127.0.0.1:5000, https://192.168.68.148, http://octopi.local)
+R8: Webcam compatibility: deprecated settings paths ['webcam.snapshot', 'webcam.stream'] still accessed, compatibility overlay issues deprecation WARNING (added in 1.9.0)
+R9: Autoconnect on startup tries configured serial port; if port=None, auto-detection is performed
+R10: CSRF protection defaults to DISABLED for third-party plugins not explicitly declaring is_blueprint_csrf_protected
+
+Invariants (must ALWAYS hold):
+- Monitoring state transitions must follow the valid state machine (No [Processed]→[New] equivalent jumps)
+- A print job must have matching start/cancel/done events with same file path and user
+- User session cleanup must match prior login events
+- Server heartbeat must appear approximately every 900s while server is running
+- Connectivity checker state transitions (online/offline) must be consistent across checks
+
+## 5. Numeric Thresholds
+| Parameter | Value | Log Impact |
+|-----------|-------|-------------|
+| communication timeout | 30s (default) | Communication timeout -> timeout warning, retry |
+| communicationBusy timeout | 3s (default) | Busy protocol detected, timeout adjusted to 3s |
+| maxTimeouts idle | 2 | After 2 timeouts while idle -> disconnect |
+| maxTimeouts printing | 5 | After 5 timeouts while printing -> disconnect |
+| maxTimeouts long | 5 | After 5 timeouts on long commands -> disconnect |
+| heartbeat interval | 900s | "Server heartbeat <3" every 15 min |
+| temperature timeout | 5s (no target) / 2s (target set) | Temperature query intervals |
+| sdStatus timeout | 1s | SD print status query while SD printing |
+| connectivity check interval | 900s (CONST_15MIN) | "Connectivity state is currently: offline" |
+| preemptive cache effort | up to 26s observed | "Preemptively caching / ... done in Xs" |
+| maxWritePasses | 5 | Max write attempts before communication declared dead |
+| resendRatioThreshold | 10% | Percentage of resends considered critical |
+| autorefreshInterval | 1s | Serial port list refresh while disconnected |
+
+## 6. Log Pattern -> Meaning Map
+| Log Pattern | Level | Meaning | Expected |
+|-------------|-------|---------|----------|
+| "Changing monitoring state from X to Y" | INFO | State machine transition | Yes |
+| "Communication timeout while printing" | INFO | Serial timeout during print, triggering response | Yes |
+| "Unexpected error while reading from serial port" | ERROR | Serial read failure, traceback follows | No |
+| "Connectivity state is currently: offline" | INFO | Network connectivity lost | Can happen |
+| "Resolving octoprint.org is not working" | INFO | DNS resolution failure | Can happen |
+| "Server heartbeat <3" | INFO | Periodic heartbeat on schedule (900s) | Yes |
+| "There is a non-dict value on the path to plugins...note" | WARNING | Sticky Pad plugin settings corrupted | No, but non-fatal |
+| "lastmodified is not timezone aware" | WARNING | Flask preemptive cache issue | Yes (known issue) |
+| "CSRF Protection for Blueprint of plugin X is DISABLED" | WARNING | Plugin doesn't declare CSRF protection | Yes (third-party plugins) |
+| "Sent tracking event ping/pong/startup/..." | INFO | Analytics event sent | Yes |
+| "PSU response error {...}" | ERROR | ZupFe plugin PSU control HTTP error | No (plugin) |
+| "Preemptively caching / ... done in Xs" | INFO | UI pre-rendering for specified base_url | Yes |
+| "Processing startup event, this is our first event" | INFO | Events system initialized | Yes |
+| "New connection from client: IP" | INFO | WebSocket/SockJS client connected | Yes |
+| "Passively logging in user X from IP" | INFO | Auto-login via cookie/header | Yes |
+| "Logged in user: X" | INFO | User authentication | Yes |
+| "Cleaning up user session X for user Y" | INFO | Session cleanup on logout/timeout | Yes |
+| "Firmware sent the following capability report:" | INFO | Printer capabilities received | Yes |
+| "Printer seems to support the busy protocol" | INFO | Busy protocol detected, timeout adjusted | Yes |
+| "Print job selected/started/done/cancelled" | INFO | Print lifecycle events | Yes |
+| "Unexpected error while reading from serial port" | ERROR | Serial communication disruption | No |
+| "Exception on /api/files [GET]" | ERROR | API endpoint failure with traceback | No |
+| "We don't appear to be online, not fetching plugin blacklist" | INFO | Offline startup behavior | Yes |
+| "Gadget is now watching!" | INFO | OctoEverywhere print monitoring started | Yes |
+| "Gadget has stopped watching!" | INFO | OctoEverywhere print monitoring ended | Yes |
+| "NotificationsHandler successfully sent 'started'" | INFO | OctoEverywhere notification sent | Yes |
+| "A cooling fan control command was seen, but fanspeedslider is locked" | INFO | MarlinSlider plugin suppressing fan cmd | Yes |
+| "Resetting webasset folder ..." | INFO | Web asset regeneration at startup | Yes |
+| "Autoconnect on startup is configured" | INFO | Auto-connection to printer enabled | Yes |
+| "Slipstream took X to fully update the cache" | INFO | OctoEverywhere cache update timing | Yes |
+
+## 7. Known Non-Issues
+- "lastmodified is not timezone aware" WARNING → Flask preemptive cache benign warning, no functional impact
+- "There is a non-dict value on the path to plugins...note" WARNING → Sticky Pad settings migration issue, repeated per access
+- "CSRF Protection for Blueprint of plugin X is DISABLED" WARNING → Third-party plugin standard, security downgrade but normal
+- "A cooling fan control command was seen, but fanspeedslider is locked" → MarlinSlider design, expected during print
+- "PSU response error..." ERROR → ZupFe plugin attempting to control PSU via web API, non-critical for printing
+- "We found a webcam multicam/Default but it doesn't support snapshots" → MultiCam plugin limitation, OctoEverywhere auto-detects URL
+- "ShouldPrintingTimersBeRunning is not in a printing state: OPERATIONAL" → OctoEverywhere timer cleanup after state change, benign
+- "Communication timeout while printing" → Busy protocol triggers this during cancel/long operations, followed by recovery
+- "DeprecationWarning: Detected access to deprecated settings path" → Plugin compatibility overlay, normal until plugins migrate
+- "Connectivity state is currently: offline" → Expected after reboot before network fully available
