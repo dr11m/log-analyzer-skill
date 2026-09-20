@@ -1,6 +1,6 @@
 # log-analyzer-suite — документация
 
-статья пор эти скилы - https://t.me/agentic_madness/5
+статья про эти скилы - https://t.me/agentic_madness/5
 
 ## Рабочие результаты
 
